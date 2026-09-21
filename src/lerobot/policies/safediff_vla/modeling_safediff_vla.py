@@ -42,10 +42,16 @@ from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LAN
 from .configuration_safediff_vla import SafeDiffVLAConfig
 from .domain_adapter import LiberoBackboneDomainAdapter, load_processor_normalization_stats
 from .execution import ActionExecutor
-from .rotation_encoding import ENCODED_DIM, decode as decode_rotation, encode as encode_rotation
+from .rotation_encoding import (
+    ENCODED_DIM,
+    GRIPPER_INDEX_RAW,
+    decode as decode_rotation,
+    encode as encode_rotation,
+)
 from .state_predictor import SubgoalStatePredictor
+from .target_point_head import TargetPointHead
 from .temporal_decoder import TemporalActionDecoder
-from .utils import masked_mse, pad_or_crop_horizon, pad_or_crop_mask
+from .utils import find_grasp_target, masked_mse, pad_or_crop_horizon, pad_or_crop_mask
 
 
 class SafeDiffVLAPolicy(PreTrainedPolicy):
@@ -79,8 +85,9 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
         if config.freeze_backbone:
             self.backbone.requires_grad_(False)
 
-        if self.architecture in ("temporal_decoder", "temporal_decoder_subgoal"):
+        if self.architecture in ("temporal_decoder", "temporal_decoder_subgoal", "temporal_decoder_grounded_grasp"):
             use_subgoal = self.architecture == "temporal_decoder_subgoal"
+            use_target_xyz = self.architecture == "temporal_decoder_grounded_grasp"
             self._register_rotation_stats(dataset_stats)
             # `ENCODED_DIM` (10) replaces the raw 7-D [xyz, rx, ry, rz, gripper] layout with
             # [xyz, sin(rx), cos(rx), sin(ry), cos(ry), sin(rz), cos(rz), gripper] everywhere the
@@ -99,12 +106,19 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
                 ffn_dim=config.decoder_ffn_dim,
                 dropout=config.decoder_dropout,
                 use_subgoal=use_subgoal,
+                use_target_xyz=use_target_xyz,
             )
             if use_subgoal:
                 self.latent_pool_projection = nn.Linear(self._multimodal_latent_dim(), config.latent_dim)
                 self.subgoal_state_predictor = SubgoalStatePredictor(
                     ENCODED_DIM, config.latent_dim, config.state_head_hidden_dim
                 )
+            if use_target_xyz:
+                # Unlike the subgoal path above, `TargetPointHead` reads the raw pooled latent
+                # directly (no intermediate `config.latent_dim` projection) -- see its own
+                # docstring: it's deliberately latent-only, no current-state input.
+                self.target_point_head = TargetPointHead(self._multimodal_latent_dim(), config.target_head_hidden_dim)
+                self._register_position_and_gripper_stats(dataset_stats)
         elif self.architecture not in ("smolvla_nominal", "smolvla_finetune"):
             raise ValueError(f"Unknown architecture {self.architecture!r}")
         # "smolvla_nominal" / "smolvla_finetune": nothing to build -- both just call the backbone's
@@ -168,6 +182,44 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
         self.register_buffer("state_rot_std", rot_stat(OBS_STATE, "std"))
         self.register_buffer("action_rot_mean", rot_stat(ACTION, "mean"))
         self.register_buffer("action_rot_std", rot_stat(ACTION, "std"))
+
+    def _register_position_and_gripper_stats(self, dataset_stats: dict[str, dict[str, Any]] | None) -> None:
+        """`temporal_decoder_grounded_grasp` only: per-dimension mean/std for `observation.state[:3]`
+        / `action[:3]` (xyz) and `action[6]` (gripper), used by
+        `_grounded_grasp_reactive_close` to un-normalize the current EE position and the predicted
+        grasp target into physical meters (for `SafeDiffVLAConfig.grounded_grasp_close_threshold_m`)
+        and to compute the exact normalized value that decodes to a physically "closed" gripper
+        command. Deliberately a separate, duplicated method rather than folding into
+        `_register_rotation_stats` above -- keeps that method, and every other architecture's
+        behavior, completely untouched. Same stats source/precedence/fallback as
+        `_register_rotation_stats`.
+        """
+        stats = dataset_stats
+        if stats is None and self.config.pretrained_path:
+            try:
+                stats = load_processor_normalization_stats(self.config.pretrained_path)
+            except Exception:  # noqa: BLE001 - best-effort; fall back below
+                stats = None
+
+        def stat(feature: str, statistic: str, index_slice: slice) -> Tensor:
+            if stats is not None:
+                try:
+                    value = stats[feature][statistic]
+                    value = value if isinstance(value, Tensor) else torch.as_tensor(value)
+                    return value.reshape(-1)[index_slice].float().clone()
+                except (KeyError, TypeError, IndexError):
+                    pass
+            width = index_slice.stop - index_slice.start
+            return torch.zeros(width) if statistic == "mean" else torch.ones(width)
+
+        pos_slice = slice(0, 3)
+        grip_slice = slice(GRIPPER_INDEX_RAW, GRIPPER_INDEX_RAW + 1)
+        self.register_buffer("state_pos_mean", stat(OBS_STATE, "mean", pos_slice))
+        self.register_buffer("state_pos_std", stat(OBS_STATE, "std", pos_slice))
+        self.register_buffer("action_pos_mean", stat(ACTION, "mean", pos_slice))
+        self.register_buffer("action_pos_std", stat(ACTION, "std", pos_slice))
+        self.register_buffer("action_grip_mean", stat(ACTION, "mean", grip_slice))
+        self.register_buffer("action_grip_std", stat(ACTION, "std", grip_slice))
 
     def _encode_state(self, state7: Tensor) -> Tensor:
         return encode_rotation(state7, self.state_rot_mean, self.state_rot_std)
@@ -235,6 +287,11 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
 
     def reset(self) -> None:
         self._executor = ActionExecutor(self.config)
+        # Harmless no-ops for every other architecture -- only
+        # `_grounded_grasp_reactive_close`/`_plan_temporal_decoder` (guarded on
+        # `architecture == "temporal_decoder_grounded_grasp"`) ever read these.
+        self._grounded_grasp_close_triggered = False
+        self._grounded_grasp_last_target_xyz = None
         if hasattr(self.backbone, "reset"):
             self.backbone.reset()
 
@@ -341,9 +398,16 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
         pooled = self.latent_pool_projection(self._pooled_latent(latent_tokens, latent_pad_mask))
         return self.subgoal_state_predictor(pooled, current_state)
 
+    def _predict_target_xyz(self, latent_tokens: Tensor, latent_pad_mask: Tensor | None) -> Tensor:
+        """`temporal_decoder_grounded_grasp` only: a single predicted grasp-target xyz `[B, 3]`
+        from the pooled scene latent alone (see `target_point_head.py`'s `TargetPointHead`)."""
+        pooled = self._pooled_latent(latent_tokens, latent_pad_mask)
+        return self.target_point_head(pooled)
+
     def _forward_temporal_decoder(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict[str, float]]:
         latent_tokens, latent_pad_mask = self._encode_multimodal_latent(batch)
-        current_state = self._encode_state(self._current_state(batch))
+        current_state_raw = self._current_state(batch)
+        current_state = self._encode_state(current_state_raw)
         clean_raw = pad_or_crop_horizon(batch[ACTION], self.config.action_horizon)
         clean = self._encode_action_target(clean_raw)
 
@@ -356,7 +420,21 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
             if subgoal_target is not None:
                 loss_subgoal = F.mse_loss(predicted_subgoal, self._encode_state(subgoal_target))
 
-        pred_actions = self.decoder(latent_tokens, latent_pad_mask, current_state, subgoal_state)
+        target_xyz = None
+        loss_target = clean.new_zeros(())
+        if self.architecture == "temporal_decoder_grounded_grasp":
+            target_xyz = self._predict_target_xyz(latent_tokens, latent_pad_mask)
+            gt_target_xyz, target_valid_mask = find_grasp_target(
+                current_state_raw,
+                clean_raw,
+                gripper_index=GRIPPER_INDEX_RAW,
+                gripper_open_threshold=self.config.grounded_grasp_gripper_open_threshold,
+            )
+            loss_target = masked_mse(
+                target_xyz.unsqueeze(1), gt_target_xyz.unsqueeze(1), target_valid_mask.unsqueeze(1)
+            )
+
+        pred_actions = self.decoder(latent_tokens, latent_pad_mask, current_state, subgoal_state, target_xyz=target_xyz)
 
         # Episode-end chunks are padded by repeating the last valid frame's action past the
         # episode boundary (`DatasetReader._get_query_indices`), flagged by `action_is_pad` (`[B,
@@ -402,6 +480,7 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
             loss_action
             + self.config.lambda_subgoal * loss_subgoal
             + self.config.lambda_smooth * loss_smooth
+            + self.config.lambda_target * loss_target
         )
         metrics = {
             "loss": loss.item(),
@@ -410,6 +489,7 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
             "loss_grip": loss_grip.item(),
             "loss_subgoal": loss_subgoal.item(),
             "loss_smooth": loss_smooth.item(),
+            "loss_target": loss_target.item(),
             "action_mean": clean_raw.mean().item(),
             "action_std": clean_raw.std().item(),
         }
@@ -428,7 +508,15 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
             # dimension mismatch for this (unused by us; not touched per the "don't fix subgoal
             # architecture" scope of this change) gated path only.
             metrics["predicted_subgoal_state"] = subgoal_state
-        actions_encoded = self.decoder(latent_tokens, latent_pad_mask, current_state, subgoal_state)
+        target_xyz = None
+        if self.architecture == "temporal_decoder_grounded_grasp":
+            target_xyz = self._predict_target_xyz(latent_tokens, latent_pad_mask)
+            metrics["predicted_target_xyz"] = target_xyz
+            # Cached (normalized ACTION-position space) for `_grounded_grasp_reactive_close`,
+            # called every env step from `select_action` -- not just on the (much rarer) steps
+            # this method itself runs, i.e. chunk replans.
+            self._grounded_grasp_last_target_xyz = target_xyz.detach()
+        actions_encoded = self.decoder(latent_tokens, latent_pad_mask, current_state, subgoal_state, target_xyz=target_xyz)
         # Unit-normalize each (sin, cos) pair and `atan2` back to raw Euler, right at this
         # policy's own output boundary -- everything downstream (`execution.ActionExecutor`, the
         # postprocessor, the VLABench env) keeps receiving the original 7-D layout unchanged.
@@ -446,7 +534,7 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
     def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict[str, float]]:
         if reduction != "mean":
             raise NotImplementedError("SafeDiff-VLA currently supports reduction='mean' only")
-        if self.architecture in ("temporal_decoder", "temporal_decoder_subgoal"):
+        if self.architecture in ("temporal_decoder", "temporal_decoder_subgoal", "temporal_decoder_grounded_grasp"):
             return self._forward_temporal_decoder(batch)
         if self.architecture == "smolvla_finetune":
             return self._forward_smolvla_finetune(batch)
@@ -477,4 +565,36 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         self.eval()
-        return self._executor.select_action(self._current_state(batch), lambda: self.plan_action_chunk(batch))
+        current_state = self._current_state(batch)
+        action = self._executor.select_action(current_state, lambda: self.plan_action_chunk(batch))
+        if self.architecture == "temporal_decoder_grounded_grasp":
+            action = self._grounded_grasp_reactive_close(action, current_state)
+        return action
+
+    def _grounded_grasp_reactive_close(self, action: Tensor, current_state: Tensor) -> Tensor:
+        """`temporal_decoder_grounded_grasp` only: proximity-based reactive gripper close,
+        replacing the decoder's own regressed gripper channel as the execution-time close
+        trigger (see `SafeDiffVLAConfig.architecture`'s docstring for why). Uses only quantities a
+        deployed policy actually has -- this step's own observed EE position
+        (`current_state[:3]`) and the most recently predicted grasp target
+        (`_grounded_grasp_last_target_xyz`, cached by `_plan_temporal_decoder`) -- no simulator
+        privilege, unlike `examples/safediff_vla/grasp_*_oracle*.py`'s diagnostic oracles.
+
+        One-shot latch (`_grounded_grasp_close_triggered`): once the threshold is crossed, stays
+        closed for the rest of the episode; `reset()` clears it at episode boundaries. `action`'s
+        rotation channels are never touched here.
+        """
+        if self._grounded_grasp_last_target_xyz is None:
+            return action
+        if not self._grounded_grasp_close_triggered:
+            ee_pos_m = current_state[..., :3] * self.state_pos_std + self.state_pos_mean
+            target_pos_m = self._grounded_grasp_last_target_xyz * self.action_pos_std + self.action_pos_mean
+            distance_m = (ee_pos_m - target_pos_m).norm(dim=-1)
+            if bool((distance_m <= self.config.grounded_grasp_close_threshold_m).any()):
+                self._grounded_grasp_close_triggered = True
+        if not self._grounded_grasp_close_triggered:
+            return action
+        closed_value = (0.0 - self.action_grip_mean) / self.action_grip_std
+        action = action.clone()
+        action[..., GRIPPER_INDEX_RAW] = closed_value.to(action.dtype)
+        return action

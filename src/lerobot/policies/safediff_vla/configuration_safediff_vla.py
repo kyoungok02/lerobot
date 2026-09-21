@@ -11,6 +11,7 @@ ARCHITECTURES = {
     "smolvla_finetune",
     "temporal_decoder",
     "temporal_decoder_subgoal",
+    "temporal_decoder_grounded_grasp",
 }
 
 
@@ -44,6 +45,21 @@ class SafeDiffVLAConfig(PreTrainedConfig):
     #       decoder + decomposed MSE. Requires `freeze_backbone=False` (there would be nothing to
     #       train otherwise). Exists to isolate whether `temporal_decoder`'s from-scratch design
     #       -- as opposed to e.g. dataset/task difficulty -- drives eval results.
+    #   "temporal_decoder_grounded_grasp": experimental. `temporal_decoder` plus a `TargetPointHead`
+    #       (see `target_point_head.py`) predicting one grasp-target xyz from the pooled VLM
+    #       latent, fed into the *same* decoder as an added global-conditioning term (like
+    #       `subgoal_state`, no change to the Transformer stack itself -- see
+    #       `temporal_decoder.py`'s `use_target_xyz`). Exists to separate two causal bottlenecks
+    #       found by diagnostic oracle experiments against the canonical `temporal_decoder`
+    #       checkpoint (see `examples/safediff_vla/grasp_approach_oracle_correction.py` and
+    #       `grasp_close_timing_oracle.py`): (1) target-xyz localization bias -- addressed by the
+    #       explicit `TargetPointHead` + `lambda_target` regression below -- and (2) gripper-close
+    #       *timing* not tracking actual proximity -- addressed at inference only, by ignoring the
+    #       decoder's own regressed gripper channel as the close trigger and instead closing
+    #       reactively once `current_state[:3]` comes within `grounded_grasp_close_threshold_m` of
+    #       the predicted target (see `SafeDiffVLAPolicy._grounded_grasp_reactive_close`). No other
+    #       architecture's behavior changes at all -- every new field/branch below is read only
+    #       when `architecture == "temporal_decoder_grounded_grasp"`.
     architecture: str = "temporal_decoder"
     n_obs_steps: int = 1
     # Must match the backbone's own native chunk size (`backbone.config.chunk_size` /
@@ -125,6 +141,26 @@ class SafeDiffVLAConfig(PreTrainedConfig):
     # head predicts this from scratch.
     subgoal_labels_path: str | None = None
 
+    # -- `temporal_decoder_grounded_grasp` only (see `target_point_head.py`, `utils.find_grasp_target`) --
+    # Weight of the `TargetPointHead` grasp-xyz regression loss (`utils.find_grasp_target`'s
+    # label, masked to pre-grasp samples with a real open->close transition in-horizon).
+    lambda_target: float = 1.0
+    # Hidden width of `TargetPointHead`'s small MLP (mirrors `state_head_hidden_dim` above).
+    target_head_hidden_dim: int = 256
+    # Gripper value strictly above this counts as "open" when extracting the GT grasp-target
+    # label from `action`'s gripper channel -- same `>threshold`==open convention used throughout
+    # this codebase (e.g. `examples/safediff_vla/place_phase_forensics.py`'s `GRIPPER_THRESHOLD`).
+    grounded_grasp_gripper_open_threshold: float = 0.5
+    # Inference-only: physical distance (meters, robot-base frame) between the current EE
+    # position (`observation.state[:3]`, un-normalized) and the predicted grasp target
+    # (`TargetPointHead`'s output, un-normalized) below which
+    # `SafeDiffVLAPolicy._grounded_grasp_reactive_close` force-closes the gripper -- replacing the
+    # decoder's own regressed gripper channel as the execution-time close trigger for this
+    # architecture only. Untuned first-cut default; diagnostic oracle experiments
+    # (`examples/safediff_vla/grasp_*_oracle*.py`) found actual contact typically within ~1-2cm
+    # once xyz aim is corrected.
+    grounded_grasp_close_threshold_m: float = 0.03
+
     # Per-sample squared-L2 gap (in normalized state units) between what the subgoal predictor
     # expected `execute_horizon` steps after the previous chunk and the state actually observed
     # now, above which the previous chunk is considered "not complete": instead of committing to
@@ -200,6 +236,12 @@ class SafeDiffVLAConfig(PreTrainedConfig):
             raise ValueError("lambda_grip must be non-negative")
         if self.lambda_smooth < 0:
             raise ValueError("lambda_smooth must be non-negative")
+        if self.lambda_target < 0:
+            raise ValueError("lambda_target must be non-negative")
+        if not 0 < self.grounded_grasp_gripper_open_threshold < 1:
+            raise ValueError("grounded_grasp_gripper_open_threshold must be in (0, 1)")
+        if self.grounded_grasp_close_threshold_m <= 0:
+            raise ValueError("grounded_grasp_close_threshold_m must be positive")
         backbone_chunk_size = self._backbone_native_chunk_size()
         if backbone_chunk_size is not None and backbone_chunk_size != self.action_horizon:
             logger.warning(
@@ -244,18 +286,20 @@ class SafeDiffVLAConfig(PreTrainedConfig):
                 f"a 7-dim action (3 position + 3 orientation + 1 gripper), got shape "
                 f"{self.action_feature.shape}."
             )
-        if self.architecture in ("temporal_decoder", "temporal_decoder_subgoal"):
-            # These architectures sin/cos-encode rotation (see `rotation_encoding.py`) for both
-            # `observation.state` and `action`, assuming the *same* 7-dim [xyz, rx, ry, rz,
-            # gripper] layout for both -- real state/action always share this layout (state is
-            # the current pose, action the next commanded one), so this is a real constraint, not
-            # an arbitrary one.
-            if self.robot_state_feature.shape[0] != 7:
-                raise ValueError(
-                    "temporal_decoder/temporal_decoder_subgoal's sin/cos rotation encoding assumes a "
-                    f"7-dim observation.state matching action's [xyz, rx, ry, rz, gripper] layout, got "
-                    f"shape {self.robot_state_feature.shape}."
-                )
+        # These architectures sin/cos-encode rotation (see `rotation_encoding.py`) for both
+        # `observation.state` and `action`, assuming the *same* 7-dim [xyz, rx, ry, rz,
+        # gripper] layout for both -- real state/action always share this layout (state is
+        # the current pose, action the next commanded one), so this is a real constraint, not
+        # an arbitrary one.
+        if (
+            self.architecture in ("temporal_decoder", "temporal_decoder_subgoal", "temporal_decoder_grounded_grasp")
+            and self.robot_state_feature.shape[0] != 7
+        ):
+            raise ValueError(
+                "temporal_decoder/temporal_decoder_subgoal's sin/cos rotation encoding assumes a "
+                f"7-dim observation.state matching action's [xyz, rx, ry, rz, gripper] layout, got "
+                f"shape {self.robot_state_feature.shape}."
+            )
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(lr=self.optimizer_lr, weight_decay=self.optimizer_weight_decay)
