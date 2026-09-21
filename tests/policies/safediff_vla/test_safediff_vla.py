@@ -141,6 +141,27 @@ def test_subgoal_labels_path_decodes_from_cli() -> None:
     assert config.policy.subgoal_labels_path == "outputs/data/vlabench_subgoal_labels/labels.parquet"
 
 
+def test_use_phase_conditioning_decodes_from_cli() -> None:
+    config = draccus.parse(
+        TrainPipelineConfig,
+        args=[
+            "--policy.type=safediff_vla",
+            "--policy.architecture=temporal_decoder",
+            "--policy.use_phase_conditioning=true",
+            "--policy.phase_labels_path=outputs/data/vlabench_phase_labels/labels.parquet",
+            "--dataset.repo_id=VLA/smolvla_libero",
+        ],
+    )
+    assert isinstance(config.policy, SafeDiffVLAConfig)
+    assert config.policy.use_phase_conditioning is True
+    assert config.policy.phase_labels_path == "outputs/data/vlabench_phase_labels/labels.parquet"
+
+
+def test_use_phase_conditioning_requires_temporal_decoder_architecture() -> None:
+    with pytest.raises(ValueError, match="use_phase_conditioning"):
+        make_config(architecture="smolvla_nominal", use_phase_conditioning=True)
+
+
 # ---- temporal_decoder / temporal_decoder_subgoal -------------------------------------------
 
 
@@ -185,6 +206,53 @@ def test_temporal_action_decoder_with_subgoal() -> None:
         decoder(latent_tokens, None, state, None)
 
 
+def test_temporal_action_decoder_with_phase() -> None:
+    decoder = TemporalActionDecoder(
+        action_dim=ACTION_DIM,
+        state_dim=5,
+        latent_dim=12,
+        hidden_dim=16,
+        horizon=4,
+        num_layers=1,
+        num_heads=2,
+        ffn_dim=16,
+        dropout=0.0,
+        use_phase=True,
+    )
+    latent_tokens = torch.randn(2, 6, 12)
+    state = torch.randn(2, 5)
+    phase = torch.tensor([0, 1])
+    actions = decoder(latent_tokens, None, state, phase=phase)
+    assert actions.shape == (2, 4, ACTION_DIM)
+    assert torch.isfinite(actions).all()
+    with pytest.raises(ValueError, match="use_phase"):
+        decoder(latent_tokens, None, state, phase=None)
+
+
+def test_phase_embedding_distinguishes_phase_zero_and_one() -> None:
+    """Same latent/state/subgoal input, only `phase` differs -> the action chunk must differ --
+    otherwise `phase_embedding` isn't actually reaching the decoder's conditioning."""
+    decoder = TemporalActionDecoder(
+        action_dim=ACTION_DIM,
+        state_dim=5,
+        latent_dim=12,
+        hidden_dim=16,
+        horizon=4,
+        num_layers=1,
+        num_heads=2,
+        ffn_dim=16,
+        dropout=0.0,
+        use_phase=True,
+    )
+    decoder.eval()
+    latent_tokens = torch.randn(1, 6, 12)
+    state = torch.randn(1, 5)
+    with torch.no_grad():
+        out_phase0 = decoder(latent_tokens, None, state, phase=torch.tensor([0]))
+        out_phase1 = decoder(latent_tokens, None, state, phase=torch.tensor([1]))
+    assert not torch.allclose(out_phase0, out_phase1)
+
+
 def test_temporal_decoder_policy_trains_and_freezes_backbone() -> None:
     policy = make_policy(architecture="temporal_decoder")
     loss, metrics = policy(make_batch())
@@ -203,6 +271,25 @@ def test_temporal_decoder_subgoal_regresses_subgoal_label() -> None:
     assert metrics["loss_subgoal"] > 0
     loss.backward()
     assert any(parameter.grad is not None for parameter in policy.subgoal_state_predictor.parameters())
+
+
+def test_temporal_decoder_phase_conditioning_reads_observation_phase() -> None:
+    policy = make_policy(architecture="temporal_decoder", use_phase_conditioning=True)
+    batch = make_batch(with_subgoal_label=False)
+    batch["observation.phase"] = torch.tensor([0, 1])
+    loss, metrics = policy(batch)
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert any(parameter.grad is not None for parameter in policy.decoder.phase_embedding.parameters())
+
+
+def test_temporal_decoder_phase_defaults_to_zero_without_batch_key() -> None:
+    """A direct `plan_action_chunk()` call with no `observation.phase` in the batch (e.g. the
+    open-loop calibration check in `eval_baseline_rollout.py`) must not raise -- it defaults to
+    phase 0 (pre-grasp) rather than requiring every caller to know about phase conditioning."""
+    policy = make_policy(architecture="temporal_decoder", use_phase_conditioning=True)
+    actions, _ = policy.plan_action_chunk(make_batch(with_subgoal_label=False))
+    assert actions.shape == (2, 4, ACTION_DIM)
 
 
 def test_temporal_decoder_smoothness_regularizer_is_off_by_default() -> None:
@@ -230,6 +317,26 @@ def test_temporal_decoder_select_action_never_gates() -> None:
     policy.select_action(batch)
     assert policy._executor._replan_retries == 0
     assert len(policy._executor._action_queue) == policy.config.execute_horizon - 1
+
+
+def test_select_action_injects_live_phase_from_executor() -> None:
+    """`select_action` must condition on `ActionExecutor.phase` as it stands *at call time* --
+    proven by mutating it directly between two calls and checking the decoder actually receives
+    different phase-conditioned outputs (`execute_horizon=2` -> the second call re-plans since
+    `test 235`'s queue drains after the first action, so both calls really invoke the decoder)."""
+    policy = make_policy(architecture="temporal_decoder", use_phase_conditioning=True, execute_horizon=1)
+    policy.eval()
+    batch = make_batch(batch_size=1, with_subgoal_label=False)
+
+    assert policy._executor.phase == 0
+    with torch.no_grad():
+        action_phase0 = policy.select_action(batch)
+
+    policy._executor.phase = 1
+    with torch.no_grad():
+        action_phase1 = policy.select_action(batch)
+
+    assert not torch.allclose(action_phase0, action_phase1)
 
 
 def test_select_action_queue_and_reset() -> None:

@@ -9,6 +9,7 @@ can vary independently: the same trained checkpoint can be evaluated open-loop f
 
 from __future__ import annotations
 
+import logging
 import math
 from collections import deque
 from collections.abc import Callable
@@ -18,6 +19,8 @@ import torch
 from torch import Tensor
 
 from .state_predictor import completion_gap
+
+logger = logging.getLogger(__name__)
 
 
 class ExecutorConfig(Protocol):
@@ -31,6 +34,48 @@ class ExecutorConfig(Protocol):
     use_completion_gate: bool
     completion_threshold: float
     max_replan_retries: int
+    # Execution-time-only experiment (no retraining): see `ActionExecutor`'s gripper-event handling
+    # below and `replan_on_gripper_close`'s own docstring in `configuration_safediff_vla.py`.
+    replan_on_gripper_close: bool
+    gripper_action_index: int
+    gripper_open_threshold: float
+    gripper_close_threshold: float
+    # Live phase tracking for `TemporalActionDecoder`'s `use_phase` conditioning -- see
+    # `use_phase_conditioning`'s own docstring in `configuration_safediff_vla.py`.
+    use_phase_conditioning: bool
+
+
+def detect_gripper_close_event(
+    gripper_values: Tensor, open_threshold: float, close_threshold: float
+) -> int | None:
+    """Step index of the first hysteresis-debounced open->closed gripper transition in a full
+    per-step gripper-channel trajectory. Pure post-hoc analysis function mirroring
+    `ActionExecutor`'s own incremental detection (`_update_gripper_close_state` below) one-for-one,
+    for use on an *already-executed* action stream (e.g. a `replan_on_gripper_close=False` baseline
+    rollout, which never populates `ActionExecutor.gripper_events`).
+
+    `gripper_values`: 1-D `[T]` tensor, one scalar per executed step. Convention (VLABench,
+    `envs/vlabench.py`'s `_build_ctrl_from_action`: `finger_qpos = gripper * FINGER_OPEN`): higher
+    value = more open (1 = fully open, 0 = fully closed) -- same channel/convention
+    `examples/safediff_vla/eval_baseline_rollout.py`'s `GRIPPER_INDEX`/`GRIPPER_THRESHOLD` already
+    document. Hysteresis: a value `>= open_threshold` is confidently "open", `<= close_threshold`
+    confidently "closed"; values in between hold whatever state was last confidently observed
+    (debounces chatter instead of flipping on every small oscillation around a single midpoint).
+
+    Returns the index of the first step where the debounced state is "closed" while the
+    immediately preceding step's debounced state was "open" -- i.e. the episode's first genuine
+    grasp attempt -- or `None` if the gripper never (confidently) closes after being open.
+    """
+    state: bool | None = None
+    for i, value in enumerate(gripper_values.tolist()):
+        prev_state = state
+        if value >= open_threshold:
+            state = True
+        elif value <= close_threshold or state is None:
+            state = False
+        if prev_state is True and state is False:
+            return i
+    return None
 
 
 class ActionExecutor:
@@ -47,6 +92,36 @@ class ActionExecutor:
         self._use_completion_gate = config.use_completion_gate
         self._completion_threshold = config.completion_threshold
         self._max_replan_retries = config.max_replan_retries
+        self._replan_on_gripper_close = config.replan_on_gripper_close
+        self._gripper_action_index = config.gripper_action_index
+        self._gripper_open_threshold = config.gripper_open_threshold
+        self._gripper_close_threshold = config.gripper_close_threshold
+        self._use_phase_conditioning = config.use_phase_conditioning
+        # Either feature needs the same live open->closed grasp-event detection; only
+        # `replan_on_gripper_close` additionally discards the queue on that event (see
+        # `_handle_gripper_close_event`).
+        self._track_gripper_event = self._replan_on_gripper_close or self._use_phase_conditioning
+        if self._track_gripper_event:
+            logger.info(
+                "ActionExecutor: replan_on_gripper_close=%s use_phase_conditioning=%s -- gripper "
+                "convention: action channel %d, higher value = more open (VLABench "
+                "envs/vlabench.py: finger_qpos = gripper * FINGER_OPEN; 1=fully open, 0=fully "
+                "closed), hysteresis open>=%.2f / close<=%.2f. On the episode's first debounced "
+                "open->closed transition: %s%s",
+                self._replan_on_gripper_close,
+                self._use_phase_conditioning,
+                self._gripper_action_index,
+                self._gripper_open_threshold,
+                self._gripper_close_threshold,
+                "the action queue is discarded right after that closing action executes, forcing a "
+                "fresh plan_fn() call next step"
+                if self._replan_on_gripper_close
+                else "no queue change",
+                " and `phase` switches from 0 (pre-grasp) to 1 (post-grasp/transport) for every "
+                "later plan_fn() call this episode"
+                if self._use_phase_conditioning
+                else "",
+            )
         self.reset()
 
     def reset(self) -> None:
@@ -61,6 +136,17 @@ class ActionExecutor:
         self._pending_target_state: Tensor | None = None
         self._last_gap: Tensor | None = None
         self._replan_retries = 0
+        # `replan_on_gripper_close` / `use_phase_conditioning` shared state (see
+        # `_handle_gripper_close_event` below). `_gripper_is_open` is None until the first
+        # confidently-open-or-closed action is seen.
+        self._gripper_is_open: bool | None = None
+        self._gripper_event_fired = False
+        self._step_index = -1
+        self.gripper_events: list[dict[str, Any]] = []
+        # `use_phase_conditioning` only: 0 = pre-grasp, 1 = post-grasp/transport, read by
+        # `SafeDiffVLAPolicy.select_action` on every call. Stays 0 (harmlessly unused) when the
+        # flag is off.
+        self.phase = 0
 
     def _ensembled_action(self, chunk: Tensor) -> Tensor:
         """Blend "now"-predictions from every buffered chunk with exponential-decay weights.
@@ -86,6 +172,7 @@ class ActionExecutor:
         completion gate. `plan_fn`: calls the policy's `plan_action_chunk` (or
         `predict_action_chunk`, for the temporal-ensembling path) and returns its
         `(actions, metrics)` pair."""
+        self._step_index += 1
         if self._use_temporal_ensembling:
             actions, _ = plan_fn()
             return self._ensembled_action(actions)
@@ -125,4 +212,47 @@ class ActionExecutor:
                     self._last_gap = completion_gap(self._pending_target_state, current_state)
                 self._action_queue.extend(chunk.transpose(0, 1)[: self._execute_horizon])
                 self._replan_retries = 0
-        return self._action_queue.popleft()
+        action = self._action_queue.popleft()
+        if self._track_gripper_event:
+            self._handle_gripper_close_event(action)
+        return action
+
+    def _handle_gripper_close_event(self, dispatched_action: Tensor) -> None:
+        """Shared `replan_on_gripper_close` / `use_phase_conditioning` execution-time logic (no
+        model/training changes from this method alone): on this episode's first debounced
+        open->closed gripper transition,
+          - `use_phase_conditioning`: flip `self.phase` from 0 to 1 for every later `plan_fn()`
+            call this episode.
+          - `replan_on_gripper_close`: additionally discard whatever the *old* plan still had
+            queued right after `dispatched_action` (the closing action itself) executes, so
+            `select_action`'s own `if not self._action_queue` branch calls `plan_fn()` again on the
+            very next step -- a fresh chunk conditioned on the post-grasp observation/state,
+            instead of blindly continuing the pre-grasp chunk.
+        Guarded by `_gripper_event_fired` so a single episode only ever does this once, even with
+        further open<->close chatter later on.
+        """
+        if self._gripper_event_fired:
+            return
+        assert dispatched_action.shape[0] == 1, (
+            "replan_on_gripper_close/use_phase_conditioning only support batch size 1 "
+            f"(single-environment closed-loop eval); got batch size {dispatched_action.shape[0]}"
+        )
+        value = dispatched_action[0, self._gripper_action_index].item()
+        prev_open = self._gripper_is_open
+        if value >= self._gripper_open_threshold:
+            self._gripper_is_open = True
+        elif value <= self._gripper_close_threshold or prev_open is None:
+            self._gripper_is_open = False
+        if prev_open is True and self._gripper_is_open is False:
+            self._gripper_event_fired = True
+            self.phase = 1
+            old_remaining = [a.detach().clone() for a in list(self._action_queue)[:5]]
+            self.gripper_events.append(
+                {
+                    "step_index": self._step_index,
+                    "queue_len_at_event": len(self._action_queue),
+                    "old_remaining_actions_after_grasp": old_remaining,
+                }
+            )
+            if self._replan_on_gripper_close:
+                self._action_queue.clear()

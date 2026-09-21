@@ -140,6 +140,51 @@ class SafeDiffVLAConfig(PreTrainedConfig):
     use_completion_gate: bool = True
     enable_inference_metrics: bool = False
 
+    # Execution-time-only experiment (`execution.ActionExecutor`, no model/training change): on an
+    # episode's first debounced open->closed gripper transition, discard whatever the current chunk
+    # still had queued right after that closing action executes, and force a fresh `plan_fn()` call
+    # (a new full `execute_horizon`-length chunk) on the very next step, conditioned on the
+    # post-grasp observation/state instead of blindly continuing the pre-grasp chunk. Off by
+    # default -- a checkpoint trained with this off can have it turned on at eval time with no
+    # retraining, same as `use_temporal_ensembling`/`execute_horizon` above. Only ever fires once
+    # per episode (see `ActionExecutor._handle_gripper_close_event`'s `_gripper_event_fired` guard).
+    replan_on_gripper_close: bool = False
+    # Action-vector channel read for gripper open/close detection. VLABench's 7-D action convention
+    # (`envs/vlabench.py`: `ACTION_DIM = 7  # pos(3) + euler(3) + gripper(1)`) puts gripper last, at
+    # index 6 -- same channel `examples/safediff_vla/eval_baseline_rollout.py`'s `GRIPPER_INDEX`
+    # already uses for its own (offline) gripper-transition analysis.
+    gripper_action_index: int = 6
+    # Hysteresis thresholds for debouncing the live per-step gripper signal into a binary
+    # open/closed state (`ActionExecutor`'s own predicted actions can oscillate near a single
+    # midpoint in a way the near-binary demonstrated actions used elsewhere -- e.g.
+    # `compute_subgoal_labels.py`'s single `GRIPPER_OPEN_THRESHOLD=0.5` -- don't). Convention: 1 =
+    # fully open, 0 = fully closed (`finger_qpos = gripper * FINGER_OPEN`) -- higher is *more open*,
+    # never inverted. A value >= `gripper_open_threshold` is confidently "open", <=
+    # `gripper_close_threshold` confidently "closed"; values strictly between hold whatever state
+    # was last confidently observed instead of flipping on every small oscillation.
+    gripper_open_threshold: float = 0.6
+    gripper_close_threshold: float = 0.4
+
+    # Minimal binary task-phase conditioning for `TemporalActionDecoder` (`temporal_decoder`/
+    # `temporal_decoder_subgoal` only): one extra embedding added to the decoder's per-query
+    # conditioning (`TemporalActionDecoder.phase_embedding` -- no other change to the transformer
+    # stack), phase in {0, 1} -- 0 = pre-grasp, 1 = post-grasp/transport. "Grasp" is the episode's
+    # first debounced open->closed gripper transition, same detection `replan_on_gripper_close`
+    # above uses, reusing `gripper_action_index`/`gripper_open_threshold`/`gripper_close_threshold`.
+    # At training time the label comes from `phase_labels_path` (a precomputed per-frame parquet --
+    # see `examples/safediff_vla/compute_phase_labels.py` -- computed causally: whether a grasp
+    # already happened strictly *before* this frame, never from this sample's own target action
+    # chunk). At inference, `execution.ActionExecutor` tracks it live (`ActionExecutor.phase`) and
+    # `SafeDiffVLAPolicy.select_action` injects it into the batch before calling `plan_fn()`;
+    # independent of `replan_on_gripper_close` (phase conditioning works with or without immediate
+    # replanning on grasp).
+    use_phase_conditioning: bool = False
+    # Path to a local parquet produced by `examples/safediff_vla/compute_phase_labels.py`, mapping
+    # each dataset frame's global `index` to its binary phase label (0/1). When set,
+    # `make_dataset()` wraps the training dataset so every batch carries `observation.phase`. Only
+    # affects training; at inference the phase comes from `ActionExecutor`'s own live tracking.
+    phase_labels_path: str | None = None
+
     optimizer_lr: float = 1e-4
     optimizer_weight_decay: float = 1e-6
     scheduler_warmup_steps: int = 1_000
@@ -168,6 +213,21 @@ class SafeDiffVLAConfig(PreTrainedConfig):
             raise ValueError("max_replan_retries must be non-negative")
         if self.temporal_ensemble_coeff < 0:
             raise ValueError("temporal_ensemble_coeff must be non-negative")
+        if not 0.0 <= self.gripper_close_threshold < self.gripper_open_threshold <= 1.0:
+            raise ValueError(
+                "gripper_close_threshold must be < gripper_open_threshold, both within [0, 1] "
+                f"(got close={self.gripper_close_threshold}, open={self.gripper_open_threshold})"
+            )
+        if self.gripper_action_index < 0:
+            raise ValueError("gripper_action_index must be non-negative")
+        if self.use_phase_conditioning and self.architecture not in (
+            "temporal_decoder",
+            "temporal_decoder_subgoal",
+        ):
+            raise ValueError(
+                "use_phase_conditioning requires architecture in ('temporal_decoder', "
+                f"'temporal_decoder_subgoal'), got {self.architecture!r}"
+            )
         if self.backbone_action_conversion_semantics not in {"per_step", "velocity"}:
             raise ValueError("backbone_action_conversion_semantics must be per_step or velocity")
         if self.use_backbone_domain_adapter and not self.backbone_name:

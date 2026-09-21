@@ -89,6 +89,16 @@ class LegacySafeDiffVLAConfig(PreTrainedConfig):
     use_completion_gate: bool = True
     enable_inference_metrics: bool = False
 
+    # Execution-time-only experiment, shared with `SafeDiffVLAConfig` -- see its own docstring
+    # there for the full rationale. `ActionExecutor` reads these structurally (both configs satisfy
+    # `execution.ExecutorConfig`), so they must stay present here too even though this legacy path
+    # isn't the one the experiment targets.
+    replan_on_gripper_close: bool = False
+    gripper_action_index: int = 6
+    gripper_open_threshold: float = 0.6
+    gripper_close_threshold: float = 0.4
+    use_phase_conditioning: bool = False
+
     optimizer_lr: float = 1e-4
     optimizer_weight_decay: float = 1e-6
     scheduler_warmup_steps: int = 1_000
@@ -120,6 +130,13 @@ class LegacySafeDiffVLAConfig(PreTrainedConfig):
             raise ValueError("max_replan_retries must be non-negative")
         if self.temporal_ensemble_coeff < 0:
             raise ValueError("temporal_ensemble_coeff must be non-negative")
+        if not 0.0 <= self.gripper_close_threshold < self.gripper_open_threshold <= 1.0:
+            raise ValueError(
+                "gripper_close_threshold must be < gripper_open_threshold, both within [0, 1] "
+                f"(got close={self.gripper_close_threshold}, open={self.gripper_open_threshold})"
+            )
+        if self.gripper_action_index < 0:
+            raise ValueError("gripper_action_index must be non-negative")
         if self.backbone_action_conversion_semantics not in {"per_step", "velocity"}:
             raise ValueError("backbone_action_conversion_semantics must be per_step or velocity")
         if self.use_backbone_domain_adapter and not self.backbone_name:

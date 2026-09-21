@@ -195,6 +195,12 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
 
         dataset = SubgoalLabelDataset(dataset, subgoal_labels_path)
 
+    phase_labels_path = getattr(cfg.trainable_config, "phase_labels_path", None)
+    if phase_labels_path is not None:
+        from lerobot.datasets.adapters.vlabench_phase import PhaseLabelDataset
+
+        dataset = PhaseLabelDataset(dataset, phase_labels_path)
+
     return dataset
 
 

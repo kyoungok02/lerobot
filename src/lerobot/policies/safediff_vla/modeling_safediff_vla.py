@@ -101,6 +101,7 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
                 ffn_dim=config.decoder_ffn_dim,
                 dropout=config.decoder_dropout,
                 use_subgoal=use_subgoal,
+                use_phase=config.use_phase_conditioning,
             )
             if use_subgoal:
                 self.latent_pool_projection = nn.Linear(self._multimodal_latent_dim(), config.latent_dim)
@@ -260,6 +261,19 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
         return state[:, 0] if state.ndim > 2 else state
 
     @staticmethod
+    def _phase_from_batch(batch: dict[str, Tensor], current_state: Tensor) -> Tensor:
+        """`[B]` long tensor in {0, 1} for `TemporalActionDecoder`'s `use_phase` conditioning.
+        Training: `observation.phase` (attached by `PhaseLabelDataset`, see
+        `phase_labels_path`). Direct `plan_action_chunk()`/`forward()` calls with no phase in the
+        batch (e.g. the open-loop calibration check in `eval_baseline_rollout.py`) default to 0
+        (pre-grasp) rather than raising -- `select_action()` is the one call site that actually
+        injects a live phase (from `ActionExecutor.phase`) on every step."""
+        phase = batch.get("observation.phase")
+        if phase is None:
+            return current_state.new_zeros(current_state.shape[0], dtype=torch.long)
+        return phase.reshape(-1).to(dtype=torch.long, device=current_state.device)
+
+    @staticmethod
     def _pooled_latent(latent_tokens: Tensor, latent_pad_mask: Tensor | None) -> Tensor:
         if latent_pad_mask is None:
             return latent_tokens.mean(dim=1)
@@ -358,7 +372,8 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
             if subgoal_target is not None:
                 loss_subgoal = F.mse_loss(predicted_subgoal, self._encode_state(subgoal_target))
 
-        pred_actions = self.decoder(latent_tokens, latent_pad_mask, current_state, subgoal_state)
+        phase = self._phase_from_batch(batch, current_state) if self.config.use_phase_conditioning else None
+        pred_actions = self.decoder(latent_tokens, latent_pad_mask, current_state, subgoal_state, phase)
 
         # xyz MSE / rotation sin-cos MSE (6-D now) / gripper MSE, in the encoded 10-D layout --
         # see `rotation_encoding.py`.
@@ -417,7 +432,8 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
             # dimension mismatch for this (unused by us; not touched per the "don't fix subgoal
             # architecture" scope of this change) gated path only.
             metrics["predicted_subgoal_state"] = subgoal_state
-        actions_encoded = self.decoder(latent_tokens, latent_pad_mask, current_state, subgoal_state)
+        phase = self._phase_from_batch(batch, current_state) if self.config.use_phase_conditioning else None
+        actions_encoded = self.decoder(latent_tokens, latent_pad_mask, current_state, subgoal_state, phase)
         # Unit-normalize each (sin, cos) pair and `atan2` back to raw Euler, right at this
         # policy's own output boundary -- everything downstream (`execution.ActionExecutor`, the
         # postprocessor, the VLABench env) keeps receiving the original 7-D layout unchanged.
@@ -466,4 +482,8 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         self.eval()
+        if self.config.use_phase_conditioning:
+            current_state = self._current_state(batch)
+            phase = current_state.new_full((current_state.shape[0],), self._executor.phase, dtype=torch.long)
+            batch = {**batch, "observation.phase": phase}
         return self._executor.select_action(self._current_state(batch), lambda: self.plan_action_chunk(batch))

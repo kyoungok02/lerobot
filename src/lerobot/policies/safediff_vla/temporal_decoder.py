@@ -72,10 +72,12 @@ class TemporalActionDecoder(nn.Module):
         ffn_dim: int = 1024,
         dropout: float = 0.1,
         use_subgoal: bool = False,
+        use_phase: bool = False,
     ) -> None:
         super().__init__()
         self.horizon = horizon
         self.use_subgoal = use_subgoal
+        self.use_phase = use_phase
         self.latent_projection = nn.Linear(latent_dim, hidden_dim)
         self.action_queries = nn.Parameter(torch.randn(horizon, hidden_dim) * 0.02)
         # Fixed (non-learnable) sin/cos position embedding, one per horizon slot. `action_queries`
@@ -89,6 +91,12 @@ class TemporalActionDecoder(nn.Module):
         self.state_encoder = StateEncoder(state_dim, hidden_dim)
         if use_subgoal:
             self.subgoal_encoder = StateEncoder(state_dim, hidden_dim)
+        if use_phase:
+            # Binary task-phase conditioning (0 = pre-grasp, 1 = post-grasp/transport), added as
+            # global per-query-position conditioning exactly like `state_encoder`/`subgoal_encoder`
+            # above -- no change to the transformer stack itself (`self.transformer` below is
+            # untouched). See `configuration_safediff_vla.py`'s `use_phase_conditioning` docstring.
+            self.phase_embedding = nn.Embedding(2, hidden_dim)
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=hidden_dim,
             nhead=num_heads,
@@ -106,6 +114,7 @@ class TemporalActionDecoder(nn.Module):
         latent_pad_mask: Tensor | None,
         current_state: Tensor,
         subgoal_state: Tensor | None = None,
+        phase: Tensor | None = None,
     ) -> Tensor:
         """
         Args:
@@ -118,11 +127,16 @@ class TemporalActionDecoder(nn.Module):
                 per-timestep trajectory (see `state_predictor.py`'s `SubgoalStatePredictor`) --
                 added as global conditioning to every query position. Required iff
                 `use_subgoal=True`.
+            phase: [B] long, values in {0, 1} (0 = pre-grasp, 1 = post-grasp/transport) -- added
+                as global conditioning to every query position, same as `subgoal_state`. Required
+                iff `use_phase=True`.
 
         Returns: action trajectory [B, H, action_dim].
         """
         if self.use_subgoal and subgoal_state is None:
             raise ValueError("This decoder was built with use_subgoal=True but got none.")
+        if self.use_phase and phase is None:
+            raise ValueError("This decoder was built with use_phase=True but got none.")
         batch_size = latent_tokens.shape[0]
         memory = self.latent_projection(latent_tokens)
         memory_key_padding_mask = None if latent_pad_mask is None else ~latent_pad_mask
@@ -131,6 +145,8 @@ class TemporalActionDecoder(nn.Module):
         queries = queries + self.state_encoder(current_state)[:, None, :]
         if self.use_subgoal:
             queries = queries + self.subgoal_encoder(subgoal_state)[:, None, :]
+        if self.use_phase:
+            queries = queries + self.phase_embedding(phase)[:, None, :]
 
         decoded = self.transformer(
             tgt=queries, memory=memory, memory_key_padding_mask=memory_key_padding_mask
