@@ -42,6 +42,7 @@ from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LAN
 from .configuration_safediff_vla import SafeDiffVLAConfig
 from .domain_adapter import LiberoBackboneDomainAdapter, load_processor_normalization_stats
 from .execution import ActionExecutor
+from .language_grounded_target_pooling import LanguageGroundedTargetPooling
 from .rotation_encoding import (
     ENCODED_DIM,
     GRIPPER_INDEX_RAW,
@@ -123,22 +124,25 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
                 use_subgoal=use_subgoal,
                 use_target_xyz=use_target_xyz,
             )
-            if use_subgoal or has_target_head:
+            if use_subgoal:
                 # `_pooled_latent`'s modality-aware pooling concatenates image/text-masked-mean +
                 # the state token (each `_multimodal_latent_dim()`-wide) and projects back down to
-                # `_multimodal_latent_dim()` -- built once here, shared by whichever of
-                # `_predict_subgoal`/`_predict_target_xyz` below actually calls `_pooled_latent`
-                # (never both are absent when this branch runs).
+                # `_multimodal_latent_dim()` -- used by `_predict_subgoal` only. The target head
+                # below uses its own language-grounded cross-attention pooling instead of this.
                 self.modality_pool_projection = nn.Linear(3 * self._multimodal_latent_dim(), self._multimodal_latent_dim())
-            if use_subgoal:
                 self.latent_pool_projection = nn.Linear(self._multimodal_latent_dim(), config.latent_dim)
                 self.subgoal_state_predictor = SubgoalStatePredictor(
                     ENCODED_DIM, config.latent_dim, config.state_head_hidden_dim
                 )
             if has_target_head:
-                # Unlike the subgoal path above, `TargetPointHead` reads the raw pooled latent
-                # directly (no intermediate `config.latent_dim` projection) -- see its own
-                # docstring: it's deliberately latent-only, no current-state input.
+                # Text-queried cross-attention over image tokens (see
+                # `language_grounded_target_pooling.py`) replaces `_pooled_latent`'s
+                # language-agnostic masked-mean as `TargetPointHead`'s input feature, so the
+                # instruction itself picks which image tokens matter. Unlike the subgoal path
+                # above, `TargetPointHead` reads this pooled feature directly (no intermediate
+                # `config.latent_dim` projection) -- see its own docstring: it's deliberately
+                # latent-only, no current-state input beyond the state token folded into pooling.
+                self.language_grounded_target_pooling = LanguageGroundedTargetPooling(self._multimodal_latent_dim())
                 self.target_point_head = TargetPointHead(self._multimodal_latent_dim(), config.target_head_hidden_dim)
                 self._register_position_and_gripper_stats(dataset_stats)
         elif self.architecture not in ("smolvla_nominal", "smolvla_finetune"):
@@ -485,9 +489,10 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
 
     def _predict_target_xyz(self, latent_tokens: Tensor, latent_pad_mask: Tensor | None, latent_modality_ids: Tensor) -> Tensor:
         """`temporal_decoder_grounded_grasp` only: a single predicted grasp-target xyz `[B, 3]`
-        from the pooled scene latent alone (see `target_point_head.py`'s `TargetPointHead`)."""
-        pooled = self._pooled_latent(latent_tokens, latent_pad_mask, latent_modality_ids)
-        return self.target_point_head(pooled)
+        from a language-grounded visual feature (see `language_grounded_target_pooling.py`) --
+        NOT `_pooled_latent`'s language-agnostic pooling, which `_predict_subgoal` still uses."""
+        grounded = self.language_grounded_target_pooling(latent_tokens, latent_pad_mask, latent_modality_ids)
+        return self.target_point_head(grounded)
 
     def _forward_temporal_decoder(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict[str, float]]:
         latent_tokens, latent_pad_mask, latent_modality_ids = self._encode_multimodal_latent(batch)
