@@ -1,6 +1,52 @@
 import torch
 from torch import Tensor
 
+# `_pooled_latent`'s modality-aware pooling tags -- see `compute_prefix_modality_ids`.
+IMAGE_MODALITY = 0
+TEXT_MODALITY = 1
+STATE_MODALITY = 2
+OTHER_MODALITY = -1  # trailing zero-pad past the state token (only when `prefix_length` forces it)
+
+
+def compute_prefix_modality_ids(prefix_att_masks: Tensor, lang_width: int) -> Tensor:
+    """Per-token modality tag `[B, N]` (`IMAGE_MODALITY`/`TEXT_MODALITY`/`STATE_MODALITY`/
+    `OTHER_MODALITY`) for `SmolVLAWithExpertModel.embed_prefix`'s prefix sequence, used by
+    `SafeDiffVLAPolicy._pooled_latent` to pool image/text/state tokens separately instead of
+    diluting the (relatively few) language tokens into an all-token mean dominated by the (many
+    more) image patch tokens.
+
+    Derived entirely from `embed_prefix`'s own fixed concatenation order (image tokens, then
+    language tokens, then exactly one state token -- see `modeling_safediff_vla.py`'s module
+    docstring) plus two facts already available at the caller without any extra compute or
+    re-deriving `embed_prefix`'s internals:
+      - `prefix_att_masks` (`embed_prefix`'s own third return value) already marks the state
+        token(s) with `1` and every image/language token with `0` -- so the (first, and normally
+        only) `True` position per row is exactly the state token's index, regardless of how many
+        image tokens precede it or whether any camera slot is a zero-padded "missing camera"
+        placeholder (`SmolVLAPolicy.prepare_images`) -- both read as ordinary image tokens here,
+        matching `_pooled_latent`'s own pad-mask-aware handling downstream.
+      - `lang_width` (`lang_tokens.shape[1]`, the tokenizer's fixed padded length) is the language
+        block's exact width, and that block always sits immediately before the state token.
+    Everything before `state_idx - lang_width` is therefore image, `[state_idx - lang_width,
+    state_idx)` is language, and `state_idx` itself is state. Positions after `state_idx` (only
+    reachable if `SmolVLAConfig.prefix_length` forces trailing padding -- never the case with this
+    codebase's default `prefix_length=-1`) are left as `OTHER_MODALITY`, correctly excluded from
+    every modality's masked mean.
+    """
+    bsz, seq_len = prefix_att_masks.shape
+    device = prefix_att_masks.device
+    positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
+    state_idx = prefix_att_masks.to(torch.long).argmax(dim=1, keepdim=True)  # [B, 1]
+    lang_start = state_idx - lang_width
+
+    modality_ids = torch.full((bsz, seq_len), OTHER_MODALITY, dtype=torch.long, device=device)
+    modality_ids = torch.where(positions < lang_start, torch.full_like(modality_ids, IMAGE_MODALITY), modality_ids)
+    modality_ids = torch.where(
+        (positions >= lang_start) & (positions < state_idx), torch.full_like(modality_ids, TEXT_MODALITY), modality_ids
+    )
+    modality_ids = torch.where(positions == state_idx, torch.full_like(modality_ids, STATE_MODALITY), modality_ids)
+    return modality_ids
+
 
 def pad_or_crop_horizon(actions: Tensor, horizon: int) -> Tensor:
     if actions.shape[1] >= horizon:

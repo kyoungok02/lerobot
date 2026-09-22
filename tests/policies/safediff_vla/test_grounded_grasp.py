@@ -15,7 +15,14 @@ from lerobot.policies.safediff_vla.modeling_safediff_vla import SafeDiffVLAPolic
 from lerobot.policies.safediff_vla.rotation_encoding import GRIPPER_INDEX_RAW
 from lerobot.policies.safediff_vla.target_point_head import TargetPointHead
 from lerobot.policies.safediff_vla.temporal_decoder import TemporalActionDecoder
-from lerobot.policies.safediff_vla.utils import find_grasp_target
+from lerobot.policies.safediff_vla.utils import (
+    IMAGE_MODALITY,
+    OTHER_MODALITY,
+    STATE_MODALITY,
+    TEXT_MODALITY,
+    compute_prefix_modality_ids,
+    find_grasp_target,
+)
 from lerobot.utils.constants import ACTION, OBS_STATE
 from tests.policies.safediff_vla.test_safediff_vla import (
     ACTION_DIM,
@@ -124,6 +131,213 @@ def test_target_point_head_shape_and_gradient() -> None:
     target_xyz.sum().backward()
     assert pooled_latent.grad is not None
     assert any(p.grad is not None and torch.any(p.grad != 0) for p in head.parameters())
+
+
+# ---- compute_prefix_modality_ids ------------------------------------------------------------
+
+
+def test_compute_prefix_modality_ids_tags_image_text_state_segments() -> None:
+    """Synthetic `prefix_att_masks` (state token's own `att_masks==1` signal, exactly what
+    `embed_prefix` returns) + a known `lang_width` must recover the image/text/state boundaries
+    `_pooled_latent` relies on -- no real VLM/backbone involved."""
+    n_image, n_text = 5, 3
+    seq_len = n_image + n_text + 1  # + state
+    att_masks = torch.zeros(2, seq_len, dtype=torch.bool)
+    att_masks[:, n_image + n_text] = True  # state token's position, same for both rows here
+
+    modality_ids = compute_prefix_modality_ids(att_masks, lang_width=n_text)
+    expected = torch.tensor([IMAGE_MODALITY] * n_image + [TEXT_MODALITY] * n_text + [STATE_MODALITY])
+    assert torch.equal(modality_ids[0], expected)
+    assert torch.equal(modality_ids[1], expected)
+
+
+def test_compute_prefix_modality_ids_handles_per_sample_state_index() -> None:
+    """State token position can differ per sample (e.g. different missing-camera masking doesn't
+    shift it in practice, but the function must not assume a shared index across the batch)."""
+    seq_len = 10
+    att_masks = torch.zeros(2, seq_len, dtype=torch.bool)
+    att_masks[0, 6] = True
+    att_masks[1, 8] = True
+
+    modality_ids = compute_prefix_modality_ids(att_masks, lang_width=2)
+    assert modality_ids[0].tolist() == [0, 0, 0, 0, 1, 1, 2, -1, -1, -1]
+    assert modality_ids[1].tolist() == [0, 0, 0, 0, 0, 0, 1, 1, 2, -1]
+
+
+def test_compute_prefix_modality_ids_trailing_padding_is_other_not_image_or_text() -> None:
+    """Positions after the state token (only reachable if `prefix_length` forces trailing
+    zero-pad -- never the case with this codebase's default `prefix_length=-1`, but the function
+    must still degrade safely) are tagged `OTHER_MODALITY`, not silently folded into image/text."""
+    att_masks = torch.zeros(1, 8, dtype=torch.bool)
+    att_masks[0, 4] = True  # state at index 4, indices 5-7 are unreachable trailing pad
+    modality_ids = compute_prefix_modality_ids(att_masks, lang_width=2)
+    assert modality_ids[0, 5:].tolist() == [OTHER_MODALITY, OTHER_MODALITY, OTHER_MODALITY]
+
+
+# ---- _pooled_latent: modality-aware pooling --------------------------------------------------
+
+
+def _build_modality_batch(image_tokens: torch.Tensor, text_tokens: torch.Tensor, state_token: torch.Tensor):
+    """`image_tokens`/`text_tokens`: `[B, n, D]`, `state_token`: `[B, 1, D]` -> the
+    `(latent_tokens, latent_pad_mask, latent_modality_ids)` triple `_pooled_latent` expects."""
+    bsz = image_tokens.shape[0]
+    n_image, n_text = image_tokens.shape[1], text_tokens.shape[1]
+    tokens = torch.cat([image_tokens, text_tokens, state_token], dim=1)
+    pad_mask = torch.ones(bsz, tokens.shape[1], dtype=torch.bool)
+    modality_ids = torch.cat(
+        [
+            torch.full((bsz, n_image), IMAGE_MODALITY, dtype=torch.long),
+            torch.full((bsz, n_text), TEXT_MODALITY, dtype=torch.long),
+            torch.full((bsz, 1), STATE_MODALITY, dtype=torch.long),
+        ],
+        dim=1,
+    )
+    return tokens, pad_mask, modality_ids
+
+
+def _make_average_projection_policy(latent_dim: int = 12) -> SafeDiffVLAPolicy:
+    """A `temporal_decoder_grounded_grasp` policy with `modality_pool_projection` forced to
+    `(image_pooled + text_pooled + state_token) / 3` -- a simple, deterministic, exactly-known
+    instantiation of "concat + projection" so pooling-sensitivity comparisons below don't depend
+    on a randomly-initialized projection's own scaling."""
+    policy = make_policy(architecture=ARCH)
+    with torch.no_grad():
+        identity_blocks = torch.cat([torch.eye(latent_dim)] * 3, dim=1) / 3
+        policy.modality_pool_projection.weight.copy_(identity_blocks)
+        policy.modality_pool_projection.bias.zero_()
+    return policy
+
+
+def test_pooled_latent_shape_and_gradient() -> None:
+    policy = make_policy(architecture=ARCH)
+    d = policy._multimodal_latent_dim()
+    image_tokens = torch.randn(3, 40, d, requires_grad=True)
+    text_tokens = torch.randn(3, 5, d, requires_grad=True)
+    state_token = torch.randn(3, 1, d, requires_grad=True)
+    tokens, pad_mask, modality_ids = _build_modality_batch(image_tokens, text_tokens, state_token)
+
+    pooled = policy._pooled_latent(tokens, pad_mask, modality_ids)
+    assert pooled.shape == (3, d)
+    assert torch.isfinite(pooled).all()
+
+    pooled.sum().backward()
+    assert image_tokens.grad is not None and torch.any(image_tokens.grad != 0)
+    assert text_tokens.grad is not None and torch.any(text_tokens.grad != 0)
+    assert state_token.grad is not None and torch.any(state_token.grad != 0)
+    assert any(p.grad is not None and torch.any(p.grad != 0) for p in policy.modality_pool_projection.parameters())
+
+
+def test_pooled_latent_is_finite_when_a_modality_has_no_valid_tokens() -> None:
+    """Every text token masked out (`latent_pad_mask=0` there) must not produce NaN/Inf -- the
+    `clamp_min(1)` denominator guard must actually be exercised, not just present."""
+    policy = make_policy(architecture=ARCH)
+    d = policy._multimodal_latent_dim()
+    image_tokens = torch.randn(2, 10, d)
+    text_tokens = torch.randn(2, 4, d)
+    state_token = torch.randn(2, 1, d)
+    tokens, pad_mask, modality_ids = _build_modality_batch(image_tokens, text_tokens, state_token)
+    pad_mask = pad_mask.clone()
+    pad_mask[:, 10:14] = False  # mask out every text token
+
+    pooled = policy._pooled_latent(tokens, pad_mask, modality_ids)
+    assert torch.isfinite(pooled).all()
+
+
+def test_pooled_latent_image_only_change_moves_output_text_only_change_does_not() -> None:
+    """Perturbing ONLY the image tokens (text/state fixed) must change the pooled output, and that
+    change must be independent of the (unperturbed) text tokens -- proves the image branch
+    actually reaches `_pooled_latent`'s output, not just that *some* token changed it."""
+    policy = _make_average_projection_policy()
+    d = 12
+    image_a = torch.randn(1, 20, d)
+    text_tokens = torch.randn(1, 4, d)
+    state_token = torch.randn(1, 1, d)
+    image_b = image_a.clone()
+    image_b[:, 0, :] += 10.0  # perturb a single image token
+
+    tokens_a, pad_mask, modality_ids = _build_modality_batch(image_a, text_tokens, state_token)
+    tokens_b, _, _ = _build_modality_batch(image_b, text_tokens, state_token)
+    pooled_a = policy._pooled_latent(tokens_a, pad_mask, modality_ids)
+    pooled_b = policy._pooled_latent(tokens_b, pad_mask, modality_ids)
+
+    # Averaging projection: pooled = (image_pooled + text_pooled + state_token) / 3, text/state
+    # unchanged here, so the whole delta must equal exactly the image branch's own shifted mean.
+    expected_delta = (image_b.mean(dim=1) - image_a.mean(dim=1)) / 3
+    assert torch.allclose(pooled_b - pooled_a, expected_delta, atol=1e-5)
+
+
+def test_pooled_latent_text_only_change_moves_output_image_only_change_does_not() -> None:
+    """Mirror of the above: perturbing ONLY the text tokens moves the output by exactly the text
+    branch's own shifted mean, with image/state held fixed."""
+    policy = _make_average_projection_policy()
+    d = 12
+    image_tokens = torch.randn(1, 20, d)
+    text_a = torch.randn(1, 4, d)
+    state_token = torch.randn(1, 1, d)
+    text_b = text_a.clone()
+    text_b[:, 1, :] -= 7.0
+
+    tokens_a, pad_mask, modality_ids = _build_modality_batch(image_tokens, text_a, state_token)
+    tokens_b, _, _ = _build_modality_batch(image_tokens, text_b, state_token)
+    pooled_a = policy._pooled_latent(tokens_a, pad_mask, modality_ids)
+    pooled_b = policy._pooled_latent(tokens_b, pad_mask, modality_ids)
+
+    expected_delta = (text_b.mean(dim=1) - text_a.mean(dim=1)) / 3
+    assert torch.allclose(pooled_b - pooled_a, expected_delta, atol=1e-5)
+
+
+def test_pooled_latent_state_token_passes_through_unaveraged() -> None:
+    """The (single) state token must be used as-is, not diluted by averaging against anything
+    else -- perturbing it alone moves the output by exactly its own delta (under the averaging
+    projection, scaled by the fixed 1/3 block weight, same as the image/text branches above)."""
+    policy = _make_average_projection_policy()
+    d = 12
+    image_tokens = torch.randn(1, 20, d)
+    text_tokens = torch.randn(1, 4, d)
+    state_a = torch.randn(1, 1, d)
+    state_b = state_a + 3.0
+
+    tokens_a, pad_mask, modality_ids = _build_modality_batch(image_tokens, text_tokens, state_a)
+    tokens_b, _, _ = _build_modality_batch(image_tokens, text_tokens, state_b)
+    pooled_a = policy._pooled_latent(tokens_a, pad_mask, modality_ids)
+    pooled_b = policy._pooled_latent(tokens_b, pad_mask, modality_ids)
+
+    expected_delta = (state_b - state_a).squeeze(1) / 3
+    assert torch.allclose(pooled_b - pooled_a, expected_delta, atol=1e-5)
+
+
+def test_pooled_latent_far_more_sensitive_to_text_change_than_old_all_token_mean() -> None:
+    """The whole point of this fix: with many more image tokens than text tokens (a realistic
+    single/multi-camera token count vs. a short instruction), a fixed-magnitude *text-only* change
+    (standing in for an instruction swap) must move the new modality-aware pooled output far more
+    than the OLD all-token unweighted mean (`latent_tokens.mean(dim=1)`) would have moved for the
+    exact same tokens -- i.e. the fix actually undoes the dilution, not just refactors the code.
+
+    The comparison is deterministic (not seed-dependent): the text shift is a constant vector
+    added to every text token, so both deltas are exact linear functions of `n_image`/`n_text`
+    alone, independent of the (otherwise arbitrary) random image/state token values.
+    """
+    policy = _make_average_projection_policy()
+    d = 12
+    n_image, n_text = 40, 3
+    image_tokens = torch.randn(1, n_image, d)
+    state_token = torch.randn(1, 1, d)
+    text_a = torch.randn(1, n_text, d)
+    text_b = text_a + 50.0  # drastic, uniform shift standing in for a swapped instruction
+
+    tokens_a, pad_mask, modality_ids = _build_modality_batch(image_tokens, text_a, state_token)
+    tokens_b, _, _ = _build_modality_batch(image_tokens, text_b, state_token)
+
+    new_pooled_a = policy._pooled_latent(tokens_a, pad_mask, modality_ids)
+    new_pooled_b = policy._pooled_latent(tokens_b, pad_mask, modality_ids)
+    new_delta = (new_pooled_b - new_pooled_a).norm()
+
+    old_pooled_a = tokens_a.mean(dim=1)
+    old_pooled_b = tokens_b.mean(dim=1)
+    old_delta = (old_pooled_b - old_pooled_a).norm()
+
+    # Analytically: new_delta = 50/3 per dim, old_delta = 3*50/(40+3+1) per dim -> ratio ~4.9x.
+    assert new_delta > old_delta * 3
 
 
 # ---- TemporalActionDecoder target_xyz conditioning -----------------------------------------
@@ -399,3 +613,66 @@ def test_grounded_grasp_backbone_stays_frozen() -> None:
     loss.backward()
     assert all(p.grad is None for p in policy.backbone.parameters())
     assert any(p.grad is not None for p in policy.target_point_head.parameters())
+
+
+# ---- grounded_grasp_condition_decoder_on_target ablation switch -----------------------------
+
+
+def test_condition_decoder_on_target_defaults_true_unchanged_behavior() -> None:
+    """Default (True) must reproduce the existing, already-checkpointed behavior exactly --
+    regression safety for the checkpoint already trained under the old (implicit) always-True
+    contract."""
+    policy = make_policy(architecture=ARCH)
+    assert policy.config.grounded_grasp_condition_decoder_on_target is True
+    assert policy.decoder.use_target_xyz is True
+
+
+def test_condition_decoder_on_target_false_builds_unconditioned_decoder() -> None:
+    """Ablation-B condition: `TargetPointHead` is still built (auxiliary loss still trainable),
+    but the decoder itself is constructed WITHOUT target-xyz conditioning."""
+    policy = make_policy(architecture=ARCH, grounded_grasp_condition_decoder_on_target=False)
+    assert hasattr(policy, "target_point_head")
+    assert policy.decoder.use_target_xyz is False
+    assert not hasattr(policy.decoder, "target_xyz_encoder")
+
+
+def test_condition_decoder_on_target_false_still_trains_target_loss() -> None:
+    policy = make_policy(architecture=ARCH, grounded_grasp_condition_decoder_on_target=False)
+    batch = make_grounded_batch()
+    batch[OBS_STATE][:, GRIPPER_INDEX_RAW] = 0.0  # pre-grasp (state convention: 0=open)
+    batch[ACTION][:, :, GRIPPER_INDEX_RAW] = 1.0
+    batch[ACTION][:, -1, GRIPPER_INDEX_RAW] = -1.0
+    loss, metrics = policy(batch)
+    assert metrics["loss_target"] > 0
+    loss.backward()
+    assert any(p.grad is not None and torch.any(p.grad != 0) for p in policy.target_point_head.parameters())
+
+
+def test_condition_decoder_on_target_false_decoder_output_independent_of_target_head() -> None:
+    """The whole point of the ablation: with conditioning off, the decoder's action-chunk output
+    must NOT change when `target_point_head`'s parameters (hence its predictions) change --
+    proving the decoder truly never sees `target_xyz` in this mode, not just that it's *labeled*
+    unconditioned."""
+    policy = make_policy(architecture=ARCH, grounded_grasp_condition_decoder_on_target=False)
+    policy.eval()
+    batch = make_grounded_batch()
+    with torch.no_grad():
+        actions_before, _ = policy.plan_action_chunk(batch)
+        for p in policy.target_point_head.parameters():
+            p.add_(1.0)  # perturb target_point_head's own output substantially
+        actions_after, _ = policy.plan_action_chunk(batch)
+    assert torch.equal(actions_before, actions_after)
+
+
+def test_condition_decoder_on_target_true_decoder_output_does_depend_on_target_head() -> None:
+    """Contrast case: with the default (conditioning ON), the same perturbation DOES change the
+    decoder's output -- confirms the previous test isn't vacuously true for some unrelated reason."""
+    policy = make_policy(architecture=ARCH, grounded_grasp_condition_decoder_on_target=True)
+    policy.eval()
+    batch = make_grounded_batch()
+    with torch.no_grad():
+        actions_before, _ = policy.plan_action_chunk(batch)
+        for p in policy.target_point_head.parameters():
+            p.add_(1.0)
+        actions_after, _ = policy.plan_action_chunk(batch)
+    assert not torch.allclose(actions_before, actions_after)

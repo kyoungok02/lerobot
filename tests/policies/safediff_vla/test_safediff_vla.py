@@ -252,7 +252,7 @@ def test_shape_contract_latent_state_actions() -> None:
     shapes the module docstring claims."""
     policy = make_policy(architecture="temporal_decoder")
     batch = make_batch()
-    latent_tokens, _ = policy._encode_multimodal_latent(batch)
+    latent_tokens, _, _ = policy._encode_multimodal_latent(batch)
     current_state = policy._current_state(batch)
     assert latent_tokens.shape == (2, policy.backbone.num_latent_tokens, policy.backbone.multimodal_latent_dim)
     assert current_state.shape == (2, STATE_DIM)
@@ -295,7 +295,7 @@ def test_current_state_conditioning_changes_output() -> None:
     policy = make_policy(architecture="temporal_decoder")
     policy.eval()
     batch = make_batch()
-    latent_tokens, latent_pad_mask = policy._encode_multimodal_latent(batch)
+    latent_tokens, latent_pad_mask, _ = policy._encode_multimodal_latent(batch)
     state_a = policy._encode_state(policy._current_state(batch))
     state_b = policy._encode_state(policy._current_state(batch) + 1.0)
     with torch.no_grad():
@@ -336,7 +336,7 @@ def test_decomposed_loss_equals_old_pooled_mse_at_default_weights() -> None:
     assert policy.config.lambda_smooth == 0.0
     batch = make_batch(with_subgoal_label=False)
 
-    latent_tokens, latent_pad_mask = policy._encode_multimodal_latent(batch)
+    latent_tokens, latent_pad_mask, _ = policy._encode_multimodal_latent(batch)
     current_state = policy._encode_state(policy._current_state(batch))
     with torch.no_grad():
         pred_actions = policy.decoder(latent_tokens, latent_pad_mask, current_state)
@@ -415,7 +415,7 @@ def test_forward_temporal_decoder_no_padding_matches_old_pooled_mse() -> None:
     batch = make_batch(with_subgoal_label=False)
     batch["action_is_pad"] = torch.zeros(batch[ACTION].shape[0], batch[ACTION].shape[1], dtype=torch.bool)
 
-    latent_tokens, latent_pad_mask = policy._encode_multimodal_latent(batch)
+    latent_tokens, latent_pad_mask, _ = policy._encode_multimodal_latent(batch)
     current_state = policy._encode_state(policy._current_state(batch))
     with torch.no_grad():
         pred_actions = policy.decoder(latent_tokens, latent_pad_mask, current_state)
@@ -468,7 +468,7 @@ def test_loss_decomposition_slices_are_position_orientation_gripper() -> None:
     the [:3] / [3:9] / [9:10] *encoded* action slices (xyz / sin-cos rotation / gripper)."""
     policy = make_policy(architecture="temporal_decoder")
     batch = make_batch()
-    latent_tokens, latent_pad_mask = policy._encode_multimodal_latent(batch)
+    latent_tokens, latent_pad_mask, _ = policy._encode_multimodal_latent(batch)
     current_state = policy._encode_state(policy._current_state(batch))
     with torch.no_grad():
         pred_actions = policy.decoder(latent_tokens, latent_pad_mask, current_state)
