@@ -150,7 +150,9 @@ def install_env_instrumentation(policy_log: list[dict]) -> dict:
                     predicted_target_world = np.asarray(p["predicted_target_robot_frame"], dtype=float) + base
                     record["predicted_target_world"] = predicted_target_world.tolist()
                     card_pos = np.asarray(record["card_pos"], dtype=float)
+                    ee_pos = np.asarray(record["ee_pos"], dtype=float)
                     record["predicted_target_dist_to_gt_card"] = float(np.linalg.norm(predicted_target_world - card_pos))
+                    record["ee_to_predicted_target_dist"] = float(np.linalg.norm(ee_pos - predicted_target_world))
                     dists = {
                         name: float(np.linalg.norm(predicted_target_world - np.asarray(pos, dtype=float)))
                         for name, pos in record["all_card_positions"].items()
@@ -161,8 +163,16 @@ def install_env_instrumentation(policy_log: list[dict]) -> dict:
                 else:
                     record["predicted_target_world"] = None
                     record["predicted_target_dist_to_gt_card"] = None
+                    record["ee_to_predicted_target_dist"] = None
                     record["nearest_card_to_predicted_target"] = None
                     record["target_is_nearest"] = None
+
+            # wrong-object grasp signal: is any OTHER card entity currently grasped, per
+            # `extract_physics_record`'s own contact query (independent of the target's own
+            # `is_grasped`) -- and each entity's current height, for "max object/card z".
+            record["wrong_object_grasped_this_step"] = any(
+                info.get("is_grasped") for info in record.get("other_card_entities", {}).values()
+            )
             state["current_episode_steps"].append(record)
         return result
 
