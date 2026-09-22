@@ -633,6 +633,11 @@ def test_select_action_applies_reactive_close_when_near_target() -> None:
     batch = make_grounded_batch(batch_size=1)
     batch[OBS_STATE][:, :3] = 0.0
     action = policy.select_action(batch)
+    # Force a clearly-"open" gripper value on the decoder's own (otherwise randomly-initialized,
+    # not reliably far from the force-closed value below by chance) output, so this assertion is
+    # deterministic regardless of global RNG state / test execution order.
+    action = action.clone()
+    action[0, GRIPPER_INDEX_RAW] = 5.0
     # Force the cached target to sit right on top of the (zeroed) current EE position, then ask
     # again on the same still-open queue item's *next* call is not needed -- directly drive the
     # helper the way `select_action` itself does, for a deterministic, isolated check.

@@ -101,10 +101,12 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
             "temporal_decoder_subgoal",
             "temporal_decoder_grounded_grasp",
             "temporal_decoder_instruction",
+            "temporal_decoder_text_crossattn",
         ):
             use_subgoal = self.architecture == "temporal_decoder_subgoal"
             has_target_head = self.architecture == "temporal_decoder_grounded_grasp"
             use_instruction = self.architecture == "temporal_decoder_instruction"
+            use_text_crossattn = self.architecture == "temporal_decoder_text_crossattn"
             # Ablation switch (`grounded_grasp_condition_decoder_on_target`, default True):
             # `TargetPointHead` (below) is built whenever this architecture is used, regardless of
             # this flag -- the auxiliary target-regression loss is always trainable. Only the
@@ -131,6 +133,7 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
                 use_subgoal=use_subgoal,
                 use_target_xyz=use_target_xyz,
                 use_instruction=use_instruction,
+                use_text_crossattn=use_text_crossattn,
             )
             if use_subgoal:
                 # `_pooled_latent`'s modality-aware pooling concatenates image/text-masked-mean +
@@ -566,6 +569,7 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
             subgoal_state,
             target_xyz=decoder_target_xyz,
             instruction_embedding=instruction_embedding,
+            latent_modality_ids=latent_modality_ids,
         )
 
         # xyz MSE / rotation sin-cos MSE (6-D now) / gripper MSE, in the encoded 10-D layout --
@@ -646,6 +650,7 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
             subgoal_state,
             target_xyz=decoder_target_xyz,
             instruction_embedding=instruction_embedding,
+            latent_modality_ids=latent_modality_ids,
         )
         # Unit-normalize each (sin, cos) pair and `atan2` back to raw Euler, right at this
         # policy's own output boundary -- everything downstream (`execution.ActionExecutor`, the
@@ -669,6 +674,7 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
             "temporal_decoder_subgoal",
             "temporal_decoder_grounded_grasp",
             "temporal_decoder_instruction",
+            "temporal_decoder_text_crossattn",
         ):
             return self._forward_temporal_decoder(batch)
         if self.architecture == "smolvla_finetune":

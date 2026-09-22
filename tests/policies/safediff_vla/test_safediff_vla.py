@@ -227,6 +227,58 @@ def test_instruction_embedding_conditioning_changes_decoder_output() -> None:
     assert not torch.allclose(out_a, out_b)
 
 
+def test_temporal_action_decoder_with_text_crossattn() -> None:
+    decoder = TemporalActionDecoder(
+        action_dim=ACTION_DIM, state_dim=5, latent_dim=12, hidden_dim=16, horizon=4,
+        num_layers=1, num_heads=2, ffn_dim=16, dropout=0.0, use_text_crossattn=True,
+    )
+    latent_tokens = torch.randn(2, 6, 12)
+    state = torch.randn(2, 5)
+    modality_ids = torch.tensor([[0, 0, 0, 1, 1, 2]] * 2)  # 3 image, 2 text, 1 state
+    actions = decoder(latent_tokens, None, state, latent_modality_ids=modality_ids)
+    assert actions.shape == (2, 4, ACTION_DIM)
+    assert torch.isfinite(actions).all()
+    with pytest.raises(ValueError, match="use_text_crossattn"):
+        decoder(latent_tokens, None, state, latent_modality_ids=None)
+
+
+def test_text_crossattn_reacts_to_text_only_change_image_state_fixed() -> None:
+    """Perturbing ONLY the text-tagged token positions (image tokens/state input fixed) must
+    change the decoder output -- no mean/max/last-token pooling of the text sequence happens
+    anywhere in this path, so this proves the extra per-token text cross-attention actually
+    reaches the action head."""
+    decoder = TemporalActionDecoder(
+        action_dim=ACTION_DIM, state_dim=5, latent_dim=12, hidden_dim=16, horizon=4,
+        num_layers=1, num_heads=2, ffn_dim=16, dropout=0.0, use_text_crossattn=True,
+    )
+    decoder.eval()
+    state = torch.randn(2, 5)
+    modality_ids = torch.tensor([[0, 0, 0, 1, 1, 2]] * 2)
+    tokens_a = torch.randn(2, 6, 12)
+    tokens_b = tokens_a.clone()
+    tokens_b[:, 3:5, :] += 5.0  # perturb only the two TEXT_MODALITY positions
+    with torch.no_grad():
+        out_a = decoder(tokens_a, None, state, latent_modality_ids=modality_ids)
+        out_b = decoder(tokens_b, None, state, latent_modality_ids=modality_ids)
+    assert not torch.allclose(out_a, out_b)
+
+
+def test_text_crossattn_finite_when_every_text_token_is_padded() -> None:
+    """Every text token masked out (`latent_pad_mask=0` there) must not produce NaN -- the
+    zero-valid-text-tokens fallback must actually be exercised, not just present."""
+    decoder = TemporalActionDecoder(
+        action_dim=ACTION_DIM, state_dim=5, latent_dim=12, hidden_dim=16, horizon=4,
+        num_layers=1, num_heads=2, ffn_dim=16, dropout=0.0, use_text_crossattn=True,
+    )
+    latent_tokens = torch.randn(2, 6, 12)
+    state = torch.randn(2, 5)
+    modality_ids = torch.tensor([[0, 0, 0, 1, 1, 2]] * 2)
+    pad_mask = torch.ones(2, 6, dtype=torch.bool)
+    pad_mask[:, 3:5] = False  # mask out every text token
+    actions = decoder(latent_tokens, pad_mask, state, latent_modality_ids=modality_ids)
+    assert torch.isfinite(actions).all()
+
+
 def test_temporal_decoder_policy_trains_and_freezes_backbone() -> None:
     policy = make_policy(architecture="temporal_decoder")
     loss, metrics = policy(make_batch())
@@ -292,6 +344,56 @@ def test_temporal_decoder_instruction_select_action_never_reactive_closes() -> N
     `architecture="temporal_decoder_grounded_grasp"` -- confirm `select_action` runs cleanly
     without it for this architecture (reactive close OFF, by construction not by a toggle)."""
     policy = make_policy(architecture="temporal_decoder_instruction")
+    action = policy.select_action(make_batch())
+    assert action.shape == (2, ACTION_DIM)
+    assert torch.isfinite(action).all()
+
+
+def test_temporal_decoder_text_crossattn_policy_trains_and_freezes_backbone() -> None:
+    policy = make_policy(architecture="temporal_decoder_text_crossattn")
+    loss, metrics = policy(make_batch())
+    assert loss.ndim == 0 and torch.isfinite(loss)
+    assert metrics["loss_subgoal"] == 0 and metrics["loss_target"] == 0  # no subgoal/target head here
+    loss.backward()
+    assert all(parameter.grad is None for parameter in policy.backbone.parameters())
+    assert any(parameter.grad is not None for parameter in policy.decoder.text_cross_attn.parameters())
+
+
+def test_temporal_decoder_text_crossattn_has_no_target_point_head_or_pooling() -> None:
+    """Regression guard: this architecture must not build any of the grounded-grasp-only or
+    pooled-instruction-only modules -- the only change from plain `temporal_decoder` is the
+    decoder's own extra `text_cross_attn` layer over the UN-pooled text token sequence."""
+    policy = make_policy(architecture="temporal_decoder_text_crossattn")
+    assert not hasattr(policy, "target_point_head")
+    assert not hasattr(policy, "language_grounded_target_pooling")
+    assert not hasattr(policy, "modality_pool_projection")
+    assert policy.decoder.use_text_crossattn is True
+    assert policy.decoder.use_instruction is False
+    assert policy.decoder.use_subgoal is False
+    assert policy.decoder.use_target_xyz is False
+    assert not hasattr(policy.decoder, "instruction_encoder")
+
+
+def test_other_architectures_never_build_text_cross_attn() -> None:
+    """Regression guard the other direction: no other architecture builds `text_cross_attn` --
+    this is a new, architecture-gated addition, not a change to existing paths."""
+    for arch in ("temporal_decoder", "temporal_decoder_subgoal", "temporal_decoder_instruction"):
+        decoder = make_policy(architecture=arch).decoder
+        assert decoder.use_text_crossattn is False
+        assert not hasattr(decoder, "text_cross_attn")
+
+
+def test_temporal_decoder_text_crossattn_plan_action_chunk_shape() -> None:
+    policy = make_policy(architecture="temporal_decoder_text_crossattn")
+    actions, metrics = policy.plan_action_chunk(make_batch())
+    assert actions.shape == (2, 4, ACTION_DIM)
+    assert torch.isfinite(actions).all()
+    assert "predicted_target_xyz" not in metrics
+    assert "predicted_subgoal_state" not in metrics
+
+
+def test_temporal_decoder_text_crossattn_select_action_never_reactive_closes() -> None:
+    policy = make_policy(architecture="temporal_decoder_text_crossattn")
     action = policy.select_action(make_batch())
     assert action.shape == (2, ACTION_DIM)
     assert torch.isfinite(action).all()

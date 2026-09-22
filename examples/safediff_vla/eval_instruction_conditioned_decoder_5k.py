@@ -1,8 +1,10 @@
 #!/usr/bin/env python
-"""Evaluation of the fresh `train_instruction_conditioned_decoder_5k.py` checkpoint
-(`temporal_decoder_instruction` -- canonical `temporal_decoder` plus the instruction added as
-global conditioning on every horizon query, see `temporal_decoder.py`'s `use_instruction`). No
-`TargetPointHead` exists for this architecture, so "where is it aiming" is read off the decoder's
+"""Evaluation for the two no-`TargetPointHead` instruction-conditioning experiments:
+`temporal_decoder_instruction` (`train_instruction_conditioned_decoder_5k.py` -- the instruction
+added as global conditioning on every horizon query) and `temporal_decoder_text_crossattn`
+(`train_text_crossattn_decoder_5k.py` -- an extra cross-attention over the raw, un-pooled text
+token sequence, applied after the canonical decoder stack). Pass `--checkpoint` to select which.
+Neither architecture has a `TargetPointHead`, so "where is it aiming" is read off the decoder's
 own predicted action-chunk trajectory directly, not a separate head's output.
 
 Part A -- same-image instruction-swap probe (same 5 scenes/seeds as the two prior
@@ -154,7 +156,7 @@ def run_instruction_swap_probe(checkpoint: str, device: str, seeds: list[int]) -
     logger.info("=== Part A: same-image instruction-swap probe (%s) ===", checkpoint)
     policy = SafeDiffVLAPolicy.from_pretrained(checkpoint).to(device)
     policy.eval()
-    assert policy.config.architecture == "temporal_decoder_instruction"
+    assert policy.config.architecture in ("temporal_decoder_instruction", "temporal_decoder_text_crossattn")
     assert not hasattr(policy, "target_point_head")
 
     preprocessor, postprocessor = make_pre_post_processors(
@@ -315,7 +317,7 @@ def run_closed_loop_rollout(checkpoint: str, device: str, seeds: list[int], outp
     logger.info("=== Part B: closed-loop rollout, seeds %d-%d (%s) ===", seeds[0], seeds[-1], checkpoint)
     policy = SafeDiffVLAPolicy.from_pretrained(checkpoint).to(device)
     policy.eval()
-    assert policy.config.architecture == "temporal_decoder_instruction"
+    assert policy.config.architecture in ("temporal_decoder_instruction", "temporal_decoder_text_crossattn")
 
     env_cfg = VLABenchEnv(task=TASK)
     envs = make_env(env_cfg, n_envs=1, use_async_envs=False)

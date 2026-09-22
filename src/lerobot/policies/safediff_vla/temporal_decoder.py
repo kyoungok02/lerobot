@@ -28,6 +28,8 @@ import math
 import torch
 from torch import Tensor, nn
 
+from .utils import TEXT_MODALITY
+
 
 def sinusoidal_positions(length: int, dim: int, device: torch.device) -> Tensor:
     """Fixed sin/cos positional embedding for the `length` horizon positions, shape [length, dim]."""
@@ -74,12 +76,14 @@ class TemporalActionDecoder(nn.Module):
         use_subgoal: bool = False,
         use_target_xyz: bool = False,
         use_instruction: bool = False,
+        use_text_crossattn: bool = False,
     ) -> None:
         super().__init__()
         self.horizon = horizon
         self.use_subgoal = use_subgoal
         self.use_target_xyz = use_target_xyz
         self.use_instruction = use_instruction
+        self.use_text_crossattn = use_text_crossattn
         self.latent_projection = nn.Linear(latent_dim, hidden_dim)
         self.action_queries = nn.Parameter(torch.randn(horizon, hidden_dim) * 0.02)
         # Fixed (non-learnable) sin/cos position embedding, one per horizon slot. `action_queries`
@@ -115,6 +119,18 @@ class TemporalActionDecoder(nn.Module):
             activation="gelu",
         )
         self.transformer = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+        if use_text_crossattn:
+            # Unlike `instruction_encoder` above (which pools the text tokens into one vector
+            # BEFORE the decoder ever sees them), this attends over the raw, un-pooled per-token
+            # text sequence directly -- no mean/max/last-token pooling, no aggregation of any kind.
+            # Applied AFTER the canonical multimodal cross-attention/self-attention stack
+            # (`self.transformer`, completely untouched), as one extra residual cross-attention:
+            # query = the transformer's own per-horizon-step output, key/value = the projected
+            # multimodal memory restricted to TEXT_MODALITY positions only (via
+            # `key_padding_mask` -- same "compute over the whole sequence, mask down to the
+            # positions that matter" approach as `language_grounded_target_pooling.py`, so no
+            # separate ragged text-only tensor/projection is needed).
+            self.text_cross_attn = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
         self.action_head = nn.Linear(hidden_dim, action_dim)
 
     def forward(
@@ -125,6 +141,7 @@ class TemporalActionDecoder(nn.Module):
         subgoal_state: Tensor | None = None,
         target_xyz: Tensor | None = None,
         instruction_embedding: Tensor | None = None,
+        latent_modality_ids: Tensor | None = None,
     ) -> Tensor:
         """
         Args:
@@ -144,6 +161,9 @@ class TemporalActionDecoder(nn.Module):
                 pooling (see `utils.masked_mean_by_modality`) -- added as global conditioning to
                 every query position exactly like `subgoal_state`/`target_xyz`. Required iff
                 `use_instruction=True`.
+            latent_modality_ids: [B, N_tokens] int modality tag per `latent_tokens` position (see
+                `utils.compute_prefix_modality_ids`) -- used only to restrict the extra text-only
+                cross-attention to TEXT_MODALITY positions. Required iff `use_text_crossattn=True`.
 
         Returns: action trajectory [B, H, action_dim].
         """
@@ -153,6 +173,8 @@ class TemporalActionDecoder(nn.Module):
             raise ValueError("This decoder was built with use_target_xyz=True but got none.")
         if self.use_instruction and instruction_embedding is None:
             raise ValueError("This decoder was built with use_instruction=True but got none.")
+        if self.use_text_crossattn and latent_modality_ids is None:
+            raise ValueError("This decoder was built with use_text_crossattn=True but got no latent_modality_ids.")
         batch_size = latent_tokens.shape[0]
         memory = self.latent_projection(latent_tokens)
         memory_key_padding_mask = None if latent_pad_mask is None else ~latent_pad_mask
@@ -169,4 +191,16 @@ class TemporalActionDecoder(nn.Module):
         decoded = self.transformer(
             tgt=queries, memory=memory, memory_key_padding_mask=memory_key_padding_mask
         )
+        if self.use_text_crossattn:
+            valid = latent_tokens.new_ones(latent_tokens.shape[:2], dtype=torch.bool) if latent_pad_mask is None else latent_pad_mask.to(torch.bool)
+            text_valid = (latent_modality_ids == TEXT_MODALITY) & valid  # [B, N_tokens], no pooling
+            # Zero-valid-text-token row would mask out every key for that row's softmax (all
+            # `-inf` -> NaN) -- never the case with a real instruction, but fall back to attending
+            # over every valid token for that row alone rather than propagate NaN.
+            no_text_tokens = text_valid.sum(dim=1, keepdim=True) == 0
+            text_valid = text_valid | (no_text_tokens & valid)
+            text_grounded, _ = self.text_cross_attn(
+                query=decoded, key=memory, value=memory, key_padding_mask=~text_valid, need_weights=False
+            )
+            decoded = decoded + text_grounded
         return self.action_head(decoded)

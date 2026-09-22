@@ -13,6 +13,7 @@ ARCHITECTURES = {
     "temporal_decoder_subgoal",
     "temporal_decoder_grounded_grasp",
     "temporal_decoder_instruction",
+    "temporal_decoder_text_crossattn",
 }
 
 
@@ -72,6 +73,18 @@ class SafeDiffVLAConfig(PreTrainedConfig):
     #       `temporal_decoder_grounded_grasp` `TargetPointHead` path entirely, which held-out
     #       xyz regression improved but never made the actual card selection track the
     #       instruction -- identity-flip rate stayed 0-25% across two independent pooling designs).
+    #       Also did not move identity-flip/correct-card rates (see
+    #       `temporal_decoder_text_crossattn` below).
+    #   "temporal_decoder_text_crossattn": experimental. `temporal_decoder` plus an EXTRA
+    #       cross-attention over the raw, un-pooled per-token text sequence, applied after the
+    #       canonical multimodal cross-attention/self-attention stack (`temporal_decoder.py`'s
+    #       `use_text_crossattn`): `queries -> canonical cross-attn(full multimodal memory) ->
+    #       extra text-only cross-attn(text tokens, no mean/max/last-token pooling of any kind) ->
+    #       action head`. Every other instruction-conditioning attempt so far (`temporal_decoder_
+    #       instruction`'s additive pooled-instruction-embedding, and `temporal_decoder_grounded_
+    #       grasp`'s two `TargetPointHead` pooling designs) collapsed the instruction into a single
+    #       vector before it reached the query; this is the first to keep it as a full, un-pooled
+    #       token sequence throughout. No `TargetPointHead`, no auxiliary loss, no reactive close.
     architecture: str = "temporal_decoder"
     n_obs_steps: int = 1
     # Must match the backbone's own native chunk size (`backbone.config.chunk_size` /
@@ -327,6 +340,7 @@ class SafeDiffVLAConfig(PreTrainedConfig):
                 "temporal_decoder_subgoal",
                 "temporal_decoder_grounded_grasp",
                 "temporal_decoder_instruction",
+                "temporal_decoder_text_crossattn",
             )
             and self.robot_state_feature.shape[0] != 7
         ):
