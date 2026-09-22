@@ -185,14 +185,17 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
 
     def _register_position_and_gripper_stats(self, dataset_stats: dict[str, dict[str, Any]] | None) -> None:
         """`temporal_decoder_grounded_grasp` only: per-dimension mean/std for `observation.state[:3]`
-        / `action[:3]` (xyz) and `action[6]` (gripper), used by
-        `_grounded_grasp_reactive_close` to un-normalize the current EE position and the predicted
-        grasp target into physical meters (for `SafeDiffVLAConfig.grounded_grasp_close_threshold_m`)
-        and to compute the exact normalized value that decodes to a physically "closed" gripper
-        command. Deliberately a separate, duplicated method rather than folding into
-        `_register_rotation_stats` above -- keeps that method, and every other architecture's
-        behavior, completely untouched. Same stats source/precedence/fallback as
-        `_register_rotation_stats`.
+        / `action[:3]` (xyz), used by `_grounded_grasp_reactive_close` to un-normalize the current
+        EE position and the predicted grasp target into physical meters (for
+        `SafeDiffVLAConfig.grounded_grasp_close_threshold_m`); `action[6]` (gripper), used to
+        compute the exact normalized value that decodes to a physically "closed" gripper command;
+        and `observation.state[6]` (gripper), used by `_degrip_for_transition_detection` to
+        un-normalize `observation.state`'s gripper channel back to raw physical units before
+        `utils.find_grasp_target`'s threshold check (see that function's docstring on why
+        `observation.state`'s and `action`'s gripper channels must never be conflated). Deliberately
+        a separate, duplicated method rather than folding into `_register_rotation_stats` above --
+        keeps that method, and every other architecture's behavior, completely untouched. Same
+        stats source/precedence/fallback as `_register_rotation_stats`.
         """
         stats = dataset_stats
         if stats is None and self.config.pretrained_path:
@@ -220,6 +223,26 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
         self.register_buffer("action_pos_std", stat(ACTION, "std", pos_slice))
         self.register_buffer("action_grip_mean", stat(ACTION, "mean", grip_slice))
         self.register_buffer("action_grip_std", stat(ACTION, "std", grip_slice))
+        self.register_buffer("state_grip_mean", stat(OBS_STATE, "mean", grip_slice))
+        self.register_buffer("state_grip_std", stat(OBS_STATE, "std", grip_slice))
+
+    def _degrip_for_transition_detection(self, current_state_raw: Tensor, clean_raw: Tensor) -> tuple[Tensor, Tensor]:
+        """Return copies of `current_state_raw` / `clean_raw` with ONLY the gripper channel
+        un-normalized back to raw physical scale -- xyz/rotation stay exactly as given (still
+        MEAN_STD-normalized during training), since `find_grasp_target`'s returned `target_xyz`
+        must stay in the same space `TargetPointHead` is trained against. Only the gripper index
+        needs raw physical units, for `SafeDiffVLAConfig.grounded_grasp_gripper_open_threshold`'s
+        raw-scale (0.5-ish) decision boundary to mean what it says -- passing normalized gripper
+        values straight into `find_grasp_target` silently miscalibrates that threshold."""
+        state_fixed = current_state_raw.clone()
+        state_fixed[..., GRIPPER_INDEX_RAW] = (
+            current_state_raw[..., GRIPPER_INDEX_RAW] * self.state_grip_std + self.state_grip_mean
+        )
+        action_fixed = clean_raw.clone()
+        action_fixed[..., GRIPPER_INDEX_RAW] = (
+            clean_raw[..., GRIPPER_INDEX_RAW] * self.action_grip_std + self.action_grip_mean
+        )
+        return state_fixed, action_fixed
 
     def _encode_state(self, state7: Tensor) -> Tensor:
         return encode_rotation(state7, self.state_rot_mean, self.state_rot_std)
@@ -411,6 +434,22 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
         clean_raw = pad_or_crop_horizon(batch[ACTION], self.config.action_horizon)
         clean = self._encode_action_target(clean_raw)
 
+        # Episode-end chunks are padded by repeating the last valid frame's action past the
+        # episode boundary (`DatasetReader._get_query_indices`), flagged by `action_is_pad` (`[B,
+        # action_horizon]`, True = padded/repeated -- not a real supervision target). Exclude those
+        # timesteps from the pose loss entirely rather than teaching the decoder to regress toward
+        # a frozen "ghost" target it was never meant to predict, and (grounded_grasp only) from
+        # ever being selected as a demonstrated grasp-transition step -- a padding repeat is not a
+        # real event. Falls back to "everything valid" when the batch has no such key (e.g.
+        # synthetic test batches), reproducing the old unmasked behavior exactly.
+        action_is_pad = batch.get("action_is_pad")
+        if action_is_pad is not None:
+            action_is_pad_h = pad_or_crop_mask(action_is_pad, self.config.action_horizon)
+            valid_mask = ~action_is_pad_h
+        else:
+            action_is_pad_h = None
+            valid_mask = clean.new_ones(clean.shape[:2], dtype=torch.bool)
+
         subgoal_state = None
         loss_subgoal = clean.new_zeros(())
         if self.architecture == "temporal_decoder_subgoal":
@@ -424,30 +463,19 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
         loss_target = clean.new_zeros(())
         if self.architecture == "temporal_decoder_grounded_grasp":
             target_xyz = self._predict_target_xyz(latent_tokens, latent_pad_mask)
+            state_for_grasp, action_for_grasp = self._degrip_for_transition_detection(current_state_raw, clean_raw)
             gt_target_xyz, target_valid_mask = find_grasp_target(
-                current_state_raw,
-                clean_raw,
+                state_for_grasp,
+                action_for_grasp,
                 gripper_index=GRIPPER_INDEX_RAW,
                 gripper_open_threshold=self.config.grounded_grasp_gripper_open_threshold,
+                action_is_pad=action_is_pad_h,
             )
             loss_target = masked_mse(
                 target_xyz.unsqueeze(1), gt_target_xyz.unsqueeze(1), target_valid_mask.unsqueeze(1)
             )
 
         pred_actions = self.decoder(latent_tokens, latent_pad_mask, current_state, subgoal_state, target_xyz=target_xyz)
-
-        # Episode-end chunks are padded by repeating the last valid frame's action past the
-        # episode boundary (`DatasetReader._get_query_indices`), flagged by `action_is_pad` (`[B,
-        # action_horizon]`, True = padded/repeated -- not a real supervision target). Exclude those
-        # timesteps from the loss entirely rather than teaching the decoder to regress toward a
-        # frozen "ghost" target it was never meant to predict. Falls back to "everything valid"
-        # when the batch has no such key (e.g. synthetic test batches), reproducing the old
-        # unmasked behavior exactly.
-        action_is_pad = batch.get("action_is_pad")
-        if action_is_pad is not None:
-            valid_mask = ~pad_or_crop_mask(action_is_pad, self.config.action_horizon)
-        else:
-            valid_mask = clean.new_ones(clean.shape[:2], dtype=torch.bool)
 
         # xyz MSE / rotation sin-cos MSE (6-D now) / gripper MSE, in the encoded 10-D layout --
         # see `rotation_encoding.py`.
