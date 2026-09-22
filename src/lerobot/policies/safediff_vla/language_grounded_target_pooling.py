@@ -5,20 +5,33 @@ from .utils import IMAGE_MODALITY, STATE_MODALITY, TEXT_MODALITY
 
 
 class LanguageGroundedTargetPooling(nn.Module):
-    """Text-queried cross-attention over image tokens -- `TargetPointHead`'s input feature only.
-    Replaces `SafeDiffVLAPolicy._pooled_latent`'s language-agnostic masked-mean pooling (still
-    used unchanged by `_predict_subgoal`) with a feature the instruction actually shapes: which
-    image tokens matter is picked by the text itself, instead of averaging every image patch in
-    regardless of what was asked for. Does not touch `TemporalActionDecoder`'s own full-token
-    cross-attention (that reads `latent_tokens` directly, never this module's output).
+    """Per-token text-queried cross-attention over image tokens -- `TargetPointHead`'s input
+    feature only. Replaces `SafeDiffVLAPolicy._pooled_latent`'s language-agnostic masked-mean
+    pooling (still used unchanged by `_predict_subgoal`) with a feature the instruction actually
+    shapes. Does not touch `TemporalActionDecoder`'s own full-token cross-attention (that reads
+    `latent_tokens` directly, never this module's output).
 
-    Query: masked-mean TEXT_MODALITY tokens (one vector per sample -- the same text pooling
-    `_pooled_latent` already computes).
+    A first version queried with a single masked-mean-pooled text vector (one query per sample).
+    That collapsed the instruction into one summary BEFORE it ever saw the image, so a short
+    shared prefix ("primitive: Please pick the poker ...") dominated the query and the few tokens
+    that actually name the target were diluted away -- confirmed by a fresh 5k checkpoint: held-out
+    xyz L2 improved (0.0635m -> 0.0413m) but instruction-conditioned card selection got WORSE, not
+    better (nearest-card identity-flip rate across instructions 25% -> 0%, correct-instructed-card
+    rate 33.3% -> 27.8%). That design is deliberately not reused.
+
+    This version queries with EVERY text token independently: each instruction token attends over
+    the image tokens on its own (no pre-pooling before the query), so a token specific to "7 of
+    spades" can pull different image evidence than the shared "pick the poker" prefix tokens do.
+    Query: all TEXT_MODALITY tokens, one query row per text token position (padded/invalid text
+    positions are computed too -- attention is per-query-row independent, so this is exactly
+    equivalent to querying only the valid text tokens -- and then masked out below).
     Key/Value: IMAGE_MODALITY tokens only (`key_padding_mask` excludes text/state tokens and any
-    invalid/padded position, so the query can only pull from the scene).
-    Output: `[grounded_visual_feature ; text_pooled ; state_token]` projected back down to
-    `latent_dim` -- same shape contract as `_pooled_latent`'s own output, so `TargetPointHead`
-    needs no change.
+    invalid/padded position).
+    Aggregation: the per-text-token grounded outputs are masked-mean-pooled over valid text
+    positions into a single `[B, D]` vector.
+    Output: `[grounded_text_pooled ; text_pooled (the original, un-grounded masked-mean text
+    summary) ; state_token]` projected back down to `latent_dim` -- same shape contract as
+    `_pooled_latent`'s own output, so `TargetPointHead` needs no change.
     """
 
     def __init__(self, latent_dim: int, num_heads: int = 4) -> None:
@@ -40,7 +53,7 @@ class LanguageGroundedTargetPooling(nn.Module):
             mask = ((latent_modality_ids == modality) & valid).unsqueeze(-1).to(latent_tokens.dtype)
             return (latent_tokens * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1)
 
-        text_pooled = masked_mean(TEXT_MODALITY)
+        text_pooled = masked_mean(TEXT_MODALITY)  # original, un-grounded text summary
         state_mask = (latent_modality_ids == STATE_MODALITY).unsqueeze(-1).to(latent_tokens.dtype)
         state_token = (latent_tokens * state_mask).sum(dim=1) / state_mask.sum(dim=1).clamp_min(1)
 
@@ -51,10 +64,16 @@ class LanguageGroundedTargetPooling(nn.Module):
         # rather than propagate NaN.
         no_image_tokens = image_valid.sum(dim=1, keepdim=True) == 0
         image_valid = image_valid | (no_image_tokens & valid)
-        query = text_pooled.unsqueeze(1)  # [B, 1, D]
-        grounded, _ = self.cross_attn(
-            query=query, key=latent_tokens, value=latent_tokens, key_padding_mask=~image_valid, need_weights=False
-        )
-        grounded = grounded.squeeze(1)  # [B, D]
 
-        return self.output_projection(torch.cat([grounded, text_pooled, state_token], dim=-1))
+        # Query with every position (image/state rows included) -- attention is computed
+        # independently per query row, so this is exactly equivalent to querying only the text
+        # rows, without needing a ragged per-sample slice. Only the TEXT_MODALITY rows' outputs are
+        # kept below; everything else is discarded.
+        grounded_tokens, _ = self.cross_attn(
+            query=latent_tokens, key=latent_tokens, value=latent_tokens, key_padding_mask=~image_valid, need_weights=False
+        )  # [B, N, D]
+
+        text_valid_f = ((latent_modality_ids == TEXT_MODALITY) & valid).unsqueeze(-1).to(latent_tokens.dtype)
+        grounded_text_pooled = (grounded_tokens * text_valid_f).sum(dim=1) / text_valid_f.sum(dim=1).clamp_min(1)
+
+        return self.output_projection(torch.cat([grounded_text_pooled, text_pooled, state_token], dim=-1))
