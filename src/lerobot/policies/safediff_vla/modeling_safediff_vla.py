@@ -51,7 +51,16 @@ from .rotation_encoding import (
 from .state_predictor import SubgoalStatePredictor
 from .target_point_head import TargetPointHead
 from .temporal_decoder import TemporalActionDecoder
-from .utils import find_grasp_target, masked_mse, pad_or_crop_horizon, pad_or_crop_mask
+from .utils import (
+    IMAGE_MODALITY,
+    STATE_MODALITY,
+    TEXT_MODALITY,
+    compute_prefix_modality_ids,
+    find_grasp_target,
+    masked_mse,
+    pad_or_crop_horizon,
+    pad_or_crop_mask,
+)
 
 
 class SafeDiffVLAPolicy(PreTrainedPolicy):
@@ -87,7 +96,13 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
 
         if self.architecture in ("temporal_decoder", "temporal_decoder_subgoal", "temporal_decoder_grounded_grasp"):
             use_subgoal = self.architecture == "temporal_decoder_subgoal"
-            use_target_xyz = self.architecture == "temporal_decoder_grounded_grasp"
+            has_target_head = self.architecture == "temporal_decoder_grounded_grasp"
+            # Ablation switch (`grounded_grasp_condition_decoder_on_target`, default True):
+            # `TargetPointHead` (below) is built whenever this architecture is used, regardless of
+            # this flag -- the auxiliary target-regression loss is always trainable. Only the
+            # DECODER's own conditioning input depends on it -- see
+            # `SafeDiffVLAConfig.grounded_grasp_condition_decoder_on_target`'s docstring.
+            use_target_xyz = has_target_head and config.grounded_grasp_condition_decoder_on_target
             self._register_rotation_stats(dataset_stats)
             # `ENCODED_DIM` (10) replaces the raw 7-D [xyz, rx, ry, rz, gripper] layout with
             # [xyz, sin(rx), cos(rx), sin(ry), cos(ry), sin(rz), cos(rz), gripper] everywhere the
@@ -108,12 +123,19 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
                 use_subgoal=use_subgoal,
                 use_target_xyz=use_target_xyz,
             )
+            if use_subgoal or has_target_head:
+                # `_pooled_latent`'s modality-aware pooling concatenates image/text-masked-mean +
+                # the state token (each `_multimodal_latent_dim()`-wide) and projects back down to
+                # `_multimodal_latent_dim()` -- built once here, shared by whichever of
+                # `_predict_subgoal`/`_predict_target_xyz` below actually calls `_pooled_latent`
+                # (never both are absent when this branch runs).
+                self.modality_pool_projection = nn.Linear(3 * self._multimodal_latent_dim(), self._multimodal_latent_dim())
             if use_subgoal:
                 self.latent_pool_projection = nn.Linear(self._multimodal_latent_dim(), config.latent_dim)
                 self.subgoal_state_predictor = SubgoalStatePredictor(
                     ENCODED_DIM, config.latent_dim, config.state_head_hidden_dim
                 )
-            if use_target_xyz:
+            if has_target_head:
                 # Unlike the subgoal path above, `TargetPointHead` reads the raw pooled latent
                 # directly (no intermediate `config.latent_dim` projection) -- see its own
                 # docstring: it's deliberately latent-only, no current-state input.
@@ -337,12 +359,40 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
         state = batch[OBS_STATE]
         return state[:, 0] if state.ndim > 2 else state
 
-    @staticmethod
-    def _pooled_latent(latent_tokens: Tensor, latent_pad_mask: Tensor | None) -> Tensor:
+    def _pooled_latent(
+        self, latent_tokens: Tensor, latent_pad_mask: Tensor | None, latent_modality_ids: Tensor
+    ) -> Tensor:
+        """Modality-aware pooling for `TargetPointHead`/`SubgoalStatePredictor` only -- never the
+        decoder's own full-token cross-attention (`TemporalActionDecoder` reads `latent_tokens`
+        directly, untouched by this method).
+
+        Replaces the old all-token unweighted mean (`latent_tokens.mean(dim=1)` /
+        `(latent_tokens * pad_mask).sum(1) / pad_mask.sum(1)`), which drowns the handful of
+        language tokens in the many more image patch tokens -- e.g. ~sub-10% of the pooled
+        vector's weight coming from the instruction with a typical single-camera token count,
+        silently diluting the one signal `TargetPointHead` actually needs to pick the right target
+        among several visually similar candidates. Instead: masked-mean image tokens and text
+        tokens SEPARATELY (each modality's own tokens average only against each other, never
+        against the other modality's token count), keep the single state token as-is (no
+        averaging), then project the concatenation back down to `_multimodal_latent_dim()` -- see
+        `utils.compute_prefix_modality_ids` for how `latent_modality_ids` is derived.
+        """
         if latent_pad_mask is None:
-            return latent_tokens.mean(dim=1)
-        mask = latent_pad_mask.unsqueeze(-1).to(latent_tokens.dtype)
-        return (latent_tokens * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1)
+            latent_pad_mask = latent_tokens.new_ones(latent_tokens.shape[:2], dtype=torch.bool)
+        valid = latent_pad_mask.to(torch.bool)
+
+        def masked_mean(modality: int) -> Tensor:
+            mask = ((latent_modality_ids == modality) & valid).unsqueeze(-1).to(latent_tokens.dtype)
+            return (latent_tokens * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1)
+
+        image_pooled = masked_mean(IMAGE_MODALITY)
+        text_pooled = masked_mean(TEXT_MODALITY)
+        # State is exactly one token (see `compute_prefix_modality_ids`) -- summing rather than
+        # indexing directly tolerates a test double that (unlike the real backbone) tags more than
+        # one position as state, still degrading gracefully to their mean via the same clamp.
+        state_mask = (latent_modality_ids == STATE_MODALITY).unsqueeze(-1).to(latent_tokens.dtype)
+        state_token = (latent_tokens * state_mask).sum(dim=1) / state_mask.sum(dim=1).clamp_min(1)
+        return self.modality_pool_projection(torch.cat([image_pooled, text_pooled, state_token], dim=-1))
 
     def _nominal_actions(self, batch: dict[str, Tensor]) -> Tensor:
         """SmolVLA's own action-head output, unmodified. Used by `architecture="smolvla_nominal"`."""
@@ -368,15 +418,21 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
         )
         return loss, metrics
 
-    def _encode_multimodal_latent(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor | None]:
+    def _encode_multimodal_latent(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor | None, Tensor]:
         """Direct multimodal-encoder path: SmolVLA's own `embed_prefix` plus one self-attention
         pass through its VLM transformer, *without* running the flow-matching action-generation
         loop at all. Neither `predict_action_chunk` nor `forward` on the backbone expose this —
         both discard exactly this tensor (`sample_actions` assigns it to `_`) — so this
         reimplements the first few lines of `sample_actions`. Entirely read-only wrt
         `modeling_smolvla.py` (no changes there, no new interface added to it): a test double can
-        instead implement `encode_multimodal_latent(batch) -> (tokens, pad_mask_or_None)` and
-        `multimodal_latent_dim` directly.
+        instead implement `encode_multimodal_latent(batch) -> (tokens, pad_mask_or_None,
+        modality_ids)` and `multimodal_latent_dim` directly.
+
+        The third return value, `latent_modality_ids` (see `utils.compute_prefix_modality_ids`),
+        is only ever consumed by `_predict_subgoal`/`_predict_target_xyz` (via `_pooled_latent`)
+        -- `TemporalActionDecoder`'s own full-token cross-attention (used by every architecture,
+        including plain `temporal_decoder`) reads `latent_tokens`/`latent_pad_mask` exactly as
+        before and never sees it.
 
         If `freeze_backbone=False` this is also how gradients would actually reach the VLM.
         """
@@ -409,26 +465,32 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
                 use_cache=True,
             )
         latent_tokens = outputs_embeds[0].float()
+        # Cheap (no extra VLM/vision-tower forward pass): `prefix_att_masks` and `lang_tokens`'s
+        # width were already computed above for `embed_prefix`/`prefix_att_2d_masks` -- see
+        # `compute_prefix_modality_ids`'s docstring for exactly what they give us for free.
+        latent_modality_ids = compute_prefix_modality_ids(prefix_att_masks, lang_tokens.shape[1])
         if self.config.freeze_backbone:
             latent_tokens = latent_tokens.detach()
-        return latent_tokens, prefix_pad_masks
+        return latent_tokens, prefix_pad_masks, latent_modality_ids
 
     # ---- temporal_decoder / temporal_decoder_subgoal ---------------------------------------
 
-    def _predict_subgoal(self, latent_tokens: Tensor, latent_pad_mask: Tensor | None, current_state: Tensor) -> Tensor:
+    def _predict_subgoal(
+        self, latent_tokens: Tensor, latent_pad_mask: Tensor | None, latent_modality_ids: Tensor, current_state: Tensor
+    ) -> Tensor:
         """`temporal_decoder_subgoal` only: a single predicted subgoal state `[B, state_dim]` from
         the pooled scene latent + current state (see `state_predictor.py`'s `SubgoalStatePredictor`)."""
-        pooled = self.latent_pool_projection(self._pooled_latent(latent_tokens, latent_pad_mask))
+        pooled = self.latent_pool_projection(self._pooled_latent(latent_tokens, latent_pad_mask, latent_modality_ids))
         return self.subgoal_state_predictor(pooled, current_state)
 
-    def _predict_target_xyz(self, latent_tokens: Tensor, latent_pad_mask: Tensor | None) -> Tensor:
+    def _predict_target_xyz(self, latent_tokens: Tensor, latent_pad_mask: Tensor | None, latent_modality_ids: Tensor) -> Tensor:
         """`temporal_decoder_grounded_grasp` only: a single predicted grasp-target xyz `[B, 3]`
         from the pooled scene latent alone (see `target_point_head.py`'s `TargetPointHead`)."""
-        pooled = self._pooled_latent(latent_tokens, latent_pad_mask)
+        pooled = self._pooled_latent(latent_tokens, latent_pad_mask, latent_modality_ids)
         return self.target_point_head(pooled)
 
     def _forward_temporal_decoder(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict[str, float]]:
-        latent_tokens, latent_pad_mask = self._encode_multimodal_latent(batch)
+        latent_tokens, latent_pad_mask, latent_modality_ids = self._encode_multimodal_latent(batch)
         current_state_raw = self._current_state(batch)
         current_state = self._encode_state(current_state_raw)
         clean_raw = pad_or_crop_horizon(batch[ACTION], self.config.action_horizon)
@@ -453,7 +515,7 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
         subgoal_state = None
         loss_subgoal = clean.new_zeros(())
         if self.architecture == "temporal_decoder_subgoal":
-            predicted_subgoal = self._predict_subgoal(latent_tokens, latent_pad_mask, current_state)
+            predicted_subgoal = self._predict_subgoal(latent_tokens, latent_pad_mask, latent_modality_ids, current_state)
             subgoal_state = predicted_subgoal
             subgoal_target = batch.get("observation.subgoal_state")
             if subgoal_target is not None:
@@ -462,7 +524,7 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
         target_xyz = None
         loss_target = clean.new_zeros(())
         if self.architecture == "temporal_decoder_grounded_grasp":
-            target_xyz = self._predict_target_xyz(latent_tokens, latent_pad_mask)
+            target_xyz = self._predict_target_xyz(latent_tokens, latent_pad_mask, latent_modality_ids)
             state_for_grasp, action_for_grasp = self._degrip_for_transition_detection(current_state_raw, clean_raw)
             gt_target_xyz, target_valid_mask = find_grasp_target(
                 state_for_grasp,
@@ -475,7 +537,13 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
                 target_xyz.unsqueeze(1), gt_target_xyz.unsqueeze(1), target_valid_mask.unsqueeze(1)
             )
 
-        pred_actions = self.decoder(latent_tokens, latent_pad_mask, current_state, subgoal_state, target_xyz=target_xyz)
+        # `target_xyz` is always predicted and trained (above) whenever this architecture is used,
+        # but only reaches the decoder as conditioning when
+        # `grounded_grasp_condition_decoder_on_target` is True (see that field's docstring) -- the
+        # ablation-B path (auxiliary loss only, no conditioning) computes `target_xyz` for the loss
+        # but the decoder itself never sees it.
+        decoder_target_xyz = target_xyz if self.config.grounded_grasp_condition_decoder_on_target else None
+        pred_actions = self.decoder(latent_tokens, latent_pad_mask, current_state, subgoal_state, target_xyz=decoder_target_xyz)
 
         # xyz MSE / rotation sin-cos MSE (6-D now) / gripper MSE, in the encoded 10-D layout --
         # see `rotation_encoding.py`.
@@ -525,12 +593,12 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
 
     def _plan_temporal_decoder(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict[str, Tensor | float]]:
         started = perf_counter()
-        latent_tokens, latent_pad_mask = self._encode_multimodal_latent(batch)
+        latent_tokens, latent_pad_mask, latent_modality_ids = self._encode_multimodal_latent(batch)
         current_state = self._encode_state(self._current_state(batch))
         metrics: dict[str, Tensor | float] = {}
         subgoal_state = None
         if self.architecture == "temporal_decoder_subgoal":
-            subgoal_state = self._predict_subgoal(latent_tokens, latent_pad_mask, current_state)
+            subgoal_state = self._predict_subgoal(latent_tokens, latent_pad_mask, latent_modality_ids, current_state)
             # NOTE: encoded (10-D) space, while `execution.ActionExecutor`'s completion gate
             # compares this against the *raw* 7-D `current_state` it's given -- a pre-existing
             # dimension mismatch for this (unused by us; not touched per the "don't fix subgoal
@@ -538,13 +606,14 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
             metrics["predicted_subgoal_state"] = subgoal_state
         target_xyz = None
         if self.architecture == "temporal_decoder_grounded_grasp":
-            target_xyz = self._predict_target_xyz(latent_tokens, latent_pad_mask)
+            target_xyz = self._predict_target_xyz(latent_tokens, latent_pad_mask, latent_modality_ids)
             metrics["predicted_target_xyz"] = target_xyz
             # Cached (normalized ACTION-position space) for `_grounded_grasp_reactive_close`,
             # called every env step from `select_action` -- not just on the (much rarer) steps
             # this method itself runs, i.e. chunk replans.
             self._grounded_grasp_last_target_xyz = target_xyz.detach()
-        actions_encoded = self.decoder(latent_tokens, latent_pad_mask, current_state, subgoal_state, target_xyz=target_xyz)
+        decoder_target_xyz = target_xyz if self.config.grounded_grasp_condition_decoder_on_target else None
+        actions_encoded = self.decoder(latent_tokens, latent_pad_mask, current_state, subgoal_state, target_xyz=decoder_target_xyz)
         # Unit-normalize each (sin, cos) pair and `atan2` back to raw Euler, right at this
         # policy's own output boundary -- everything downstream (`execution.ActionExecutor`, the
         # postprocessor, the VLABench env) keeps receiving the original 7-D layout unchanged.

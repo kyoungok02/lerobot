@@ -45,10 +45,26 @@ class TinyBackbone(nn.Module):
         nominal = latent[:, None, : self.action_dim].expand(-1, self.horizon, -1).tanh()
         return nominal, latent
 
-    def encode_multimodal_latent(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
+    def encode_multimodal_latent(self, batch: dict[str, Tensor]) -> tuple[Tensor, None, Tensor]:
         assert batch[OBS_STATE].ndim == 2
         tokens = self.token_projection(batch[OBS_STATE])[:, None, :].expand(-1, self.num_latent_tokens, -1)
-        return tokens, None
+        # Mirrors the real backbone's fixed layout (image tokens, then text tokens, then exactly
+        # one state token -- see `utils.compute_prefix_modality_ids`), split arbitrarily since
+        # every token here is the same broadcast state projection anyway (this double has no real
+        # per-modality content) -- callers that need genuinely distinct image/text/state values
+        # use their own hand-built tensors directly against `_pooled_latent`, not this backbone.
+        n_state = 1
+        n_text = max((self.num_latent_tokens - n_state) // 2, 0)
+        n_image = self.num_latent_tokens - n_state - n_text
+        modality_ids = torch.cat(
+            [
+                tokens.new_full((tokens.shape[0], n_image), 0, dtype=torch.long),
+                tokens.new_full((tokens.shape[0], n_text), 1, dtype=torch.long),
+                tokens.new_full((tokens.shape[0], n_state), 2, dtype=torch.long),
+            ],
+            dim=1,
+        )
+        return tokens, None, modality_ids
 
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
         assert batch[OBS_STATE].ndim == 2
