@@ -274,6 +274,20 @@ def rollout(
     if render_callback is not None:
         render_callback(env)
 
+    # Provenance: the exact task name / instruction string this rollout's episodes will feed the
+    # policy, captured once right after reset (before any `select_action` call) since
+    # `task_description` is env-constant for the duration of an episode. Captured unconditionally
+    # (not just when recording_dir is set) so `eval_policy` can log it per episode even when not
+    # building a LeRobotDataset recording.
+    try:
+        provenance_task_names = list(env.call("task"))
+    except (AttributeError, NotImplementedError):
+        provenance_task_names = [""] * env.num_envs
+    try:
+        provenance_instructions = list(env.call("task_description"))
+    except (AttributeError, NotImplementedError):
+        provenance_instructions = list(provenance_task_names)
+
     recording_datasets: list[LeRobotDataset] | None = None
     raw_observation = None
     task_desc = ""
@@ -458,6 +472,8 @@ def rollout(
         "reward": torch.stack(all_rewards, dim=1),
         "success": torch.stack(all_successes, dim=1),
         "done": torch.stack(all_dones, dim=1),
+        "task_name": provenance_task_names,
+        "instruction": provenance_instructions,
     }
     if return_observations:
         stacked_observations = {}
@@ -548,6 +564,8 @@ def eval_policy(
     max_rewards = []
     all_successes = []
     all_seeds = []
+    all_task_names = []
+    all_instructions = []
     # Safety-cost metrics (LIBERO-Safety-style envs only; stay empty for every other env).
     all_safety_costs: list[float] = []
     all_violation_steps: list[int] = []
@@ -654,6 +672,8 @@ def eval_policy(
             all_seeds.extend(seeds)
         else:
             all_seeds.extend([None] * env.num_envs)
+        all_task_names.extend(rollout_data["task_name"])
+        all_instructions.extend(rollout_data["instruction"])
 
         batch_costs = rollout_data.get("cost")
         if batch_costs is not None:
@@ -736,6 +756,8 @@ def eval_policy(
                 "max_reward": max_reward,
                 "success": success,
                 "seed": seed,
+                "task_name": task_name,
+                "instruction": instruction,
                 **(
                     {
                         "safety_cost": all_safety_costs[i],
@@ -747,12 +769,14 @@ def eval_policy(
                     else {}
                 ),
             }
-            for i, (sum_reward, max_reward, success, seed) in enumerate(
+            for i, (sum_reward, max_reward, success, seed, task_name, instruction) in enumerate(
                 zip(
                     sum_rewards[:n_episodes],
                     max_rewards[:n_episodes],
                     all_successes[:n_episodes],
                     all_seeds[:n_episodes],
+                    all_task_names[:n_episodes],
+                    all_instructions[:n_episodes],
                     strict=True,
                 )
             )

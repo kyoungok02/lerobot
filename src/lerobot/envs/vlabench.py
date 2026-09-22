@@ -261,13 +261,7 @@ class VLABenchEnv(gym.Env):
             ) from last_exc
 
         # Extract task description from the dm_control task
-        task_obj = self._env.task
-        if hasattr(task_obj, "task_description"):
-            self.task_description = task_obj.task_description
-        elif hasattr(task_obj, "language_instruction"):
-            self.task_description = task_obj.language_instruction
-        else:
-            self.task_description = self.task
+        self.task_description = self._resolve_task_description(self._env.task)
 
         # Cache robot base world position so `_build_ctrl_from_action` and
         # `_get_obs` can translate between robot-frame (dataset) and
@@ -281,6 +275,57 @@ class VLABenchEnv(gym.Env):
             self._robot_base_xyz = np.array([0.0, -0.4, 0.78], dtype=np.float64)
 
         self._camera_order = self._resolve_camera_order()
+
+    def _resolve_task_description(self, task_obj: Any) -> str:
+        """Recover the per-episode natural-language instruction for the current task instance,
+        formatted to match `lerobot/vlabench_unified`'s own training task strings exactly.
+
+        VLABench task classes (see `LM4ManipBaseTask` in `VLABench/tasks/dm_task.py`) never define
+        a `task_description` or `language_instruction` attribute -- those two checks are kept below
+        only as a forward-compatible override point, but are dead code against every task class in
+        the installed VLABench package (verified by grepping the whole package for either
+        assignment: neither exists anywhere). The real per-episode instruction lives in
+        `task_obj.instructions` (a str, or a list VLABench itself samples from at random -- e.g.
+        `SelectPokerTask` sets a single-element list, so sampling is effectively deterministic per
+        episode); VLABench's own canonical accessor for it is `task_obj.get_instruction()`, the same
+        method its own evaluator calls (`VLABench/evaluation/evaluator/base.py`:
+        `observation["instruction"] = env.task.get_instruction()`).
+
+        Without this, every VLABench task silently fell back to the generic task *name* (e.g.
+        `"select_poker"`) for the model's entire language channel, on every step of every episode --
+        while the training dataset's task strings are per-episode-specific (e.g. `"primitive: Please
+        pick the poker 7 of spades"`), verified directly against the cached
+        `lerobot/vlabench_unified` episode metadata. That generic name is never a substring of any
+        real training task string, so it is out-of-distribution language input, not merely a
+        weaker/shorter version of the real instruction.
+
+        The training strings are prefixed with the task's *suite* name (`"primitive: "` /
+        `"composite: "`, matching `SUITE_TASKS` below) followed by the bare VLABench instruction --
+        that prefix is added by the lerobot-side dataset build, not by VLABench itself (grepped: no
+        occurrence of that prefix anywhere in the VLABench source), so it must be reconstructed here
+        rather than obtained from `task_obj`.
+        """
+        raw: str | None = None
+        if hasattr(task_obj, "task_description") and task_obj.task_description:
+            raw = task_obj.task_description
+        elif hasattr(task_obj, "language_instruction") and task_obj.language_instruction:
+            raw = task_obj.language_instruction
+        elif hasattr(task_obj, "get_instruction"):
+            with contextlib.suppress(Exception):
+                raw = task_obj.get_instruction()
+
+        if not raw:
+            logger.warning(
+                "VLABench task '%s' exposed no per-episode instruction (task_description/"
+                "language_instruction/get_instruction() all empty or missing) -- falling back to "
+                "the generic task name. Every step of this episode will feed the policy "
+                "target-identity-free language input.",
+                self.task,
+            )
+            return self.task
+
+        suite = next((name for name, tasks in SUITE_TASKS.items() if self.task in tasks), None)
+        return f"{suite}: {raw}" if suite is not None else str(raw)
 
     def _resolve_camera_order(self) -> list[int | None]:
         """Map ["image", "second_image", "wrist_image"] to indices into the
