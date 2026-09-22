@@ -37,9 +37,11 @@ def make_grounded_batch(batch_size: int = 2, horizon: int = 4) -> dict[str, torc
 
 def test_find_grasp_target_extracts_xyz_at_first_open_to_close_transition() -> None:
     """First open->close transition in the *full* [current_state, *action] sequence must be
-    found, including a transition landing exactly on action[:, 0]."""
+    found, including a transition landing exactly on action[:, 0]. `observation.state`'s gripper
+    polarity is the OPPOSITE of `action`'s (0.0=open here, vs action's 1.0=open) -- see
+    `utils._state_gripper_is_open` / `_action_gripper_is_open`."""
     current_state = torch.zeros(3, STATE_DIM)
-    current_state[:, GRIPPER_INDEX_RAW] = 1.0  # every row starts open
+    current_state[:, GRIPPER_INDEX_RAW] = 0.0  # every row starts open (state convention: 0=open)
 
     action = torch.zeros(3, 5, ACTION_DIM)
     action[:, :, GRIPPER_INDEX_RAW] = 1.0  # stays open by default
@@ -65,7 +67,7 @@ def test_find_grasp_target_masks_samples_with_no_transition_in_horizon() -> None
     """A window that never closes (stays open throughout) has no grasp event to ground -- must
     be masked invalid, regardless of what garbage ends up in `target_xyz` for that row."""
     current_state = torch.zeros(2, STATE_DIM)
-    current_state[:, GRIPPER_INDEX_RAW] = 1.0  # both open
+    current_state[:, GRIPPER_INDEX_RAW] = 0.0  # both open (state convention: 0=open)
 
     action = torch.zeros(2, 4, ACTION_DIM)
     action[:, :, GRIPPER_INDEX_RAW] = 1.0  # row 0: never closes within the window
@@ -82,7 +84,7 @@ def test_find_grasp_target_masks_samples_already_closed_at_current_state() -> No
     even if the action window happens to contain an open->close-looking flip later, this sample
     must not be used to ground a fresh grasp event."""
     current_state = torch.zeros(1, STATE_DIM)
-    current_state[:, GRIPPER_INDEX_RAW] = 0.0  # already closed right now
+    current_state[:, GRIPPER_INDEX_RAW] = 1.0  # already closed right now (state convention: 1=closed)
 
     action = torch.zeros(1, 4, ACTION_DIM)
     action[0, 0, GRIPPER_INDEX_RAW] = 1.0  # reopens
@@ -93,15 +95,21 @@ def test_find_grasp_target_masks_samples_already_closed_at_current_state() -> No
 
 
 def test_find_grasp_target_respects_custom_gripper_open_threshold() -> None:
+    """`gripper_open_threshold` must actually shift both `_state_gripper_is_open`'s (`<threshold`)
+    and `_action_gripper_is_open`'s (`>threshold`) decision boundaries -- constant state=action=0.6
+    reads as "closed" (not pre-grasp) under threshold=0.5 for state (0.6 is not < 0.5), but
+    "open" under threshold=0.9 (0.6 < 0.9); with a constant 0.6 action sequence, that same
+    threshold=0.9 also reads every action step as closed (0.6 is not > 0.9), producing an
+    immediate valid transition at index 0."""
     current_state = torch.full((1, STATE_DIM), 0.0)
-    current_state[0, GRIPPER_INDEX_RAW] = 0.6  # open at threshold=0.5, closed at threshold=0.7
+    current_state[0, GRIPPER_INDEX_RAW] = 0.6
     action = torch.zeros(1, 2, ACTION_DIM)
     action[0, :, GRIPPER_INDEX_RAW] = 0.6
 
-    _, valid_default = find_grasp_target(current_state, action, gripper_index=GRIPPER_INDEX_RAW, gripper_open_threshold=0.5)
-    _, valid_strict = find_grasp_target(current_state, action, gripper_index=GRIPPER_INDEX_RAW, gripper_open_threshold=0.7)
-    assert valid_default.tolist() == [False]  # no transition: open the whole window
-    assert valid_strict.tolist() == [False]  # "pre-grasp" fails: already below the stricter threshold
+    _, valid_low = find_grasp_target(current_state, action, gripper_index=GRIPPER_INDEX_RAW, gripper_open_threshold=0.5)
+    _, valid_high = find_grasp_target(current_state, action, gripper_index=GRIPPER_INDEX_RAW, gripper_open_threshold=0.9)
+    assert valid_low.tolist() == [False]  # state gate fails: 0.6 is not < 0.5, reads as closed/post-grasp
+    assert valid_high.tolist() == [True]  # state gate passes (0.6 < 0.9) AND action reads closed immediately
 
 
 # ---- TargetPointHead --------------------------------------------------------------------------
@@ -177,7 +185,7 @@ def test_policy_plan_action_chunk_actually_uses_target_point_head() -> None:
 def test_grounded_grasp_policy_trains_with_target_loss() -> None:
     policy = make_policy(architecture=ARCH)
     batch = make_grounded_batch()
-    batch[OBS_STATE][:, GRIPPER_INDEX_RAW] = 1.0  # force "pre-grasp" so loss_target is non-trivial
+    batch[OBS_STATE][:, GRIPPER_INDEX_RAW] = 0.0  # force "pre-grasp" (state convention: 0=open) so loss_target is non-trivial
     batch[ACTION][:, :, GRIPPER_INDEX_RAW] = 1.0
     batch[ACTION][:, -1, GRIPPER_INDEX_RAW] = -1.0  # guarantee a transition inside the horizon
     loss, metrics = policy(batch)
@@ -193,7 +201,7 @@ def test_grounded_grasp_loss_target_zero_when_batch_has_no_valid_transition() ->
     is a safe 0, not NaN, and contributes nothing (see `masked_mse`'s all-False-mask handling)."""
     policy = make_policy(architecture=ARCH)
     batch = make_grounded_batch()
-    batch[OBS_STATE][:, GRIPPER_INDEX_RAW] = 1.0
+    batch[OBS_STATE][:, GRIPPER_INDEX_RAW] = 0.0  # pre-grasp (state convention: 0=open)
     batch[ACTION][:, :, GRIPPER_INDEX_RAW] = 1.0  # never closes
     _, metrics = policy(batch)
     assert metrics["loss_target"] == pytest.approx(0.0, abs=1e-8)
@@ -205,7 +213,7 @@ def test_grounded_grasp_lambda_target_scales_loss() -> None:
     # Same weights so only lambda_target differs.
     policy_zeroed.load_state_dict(policy_default.state_dict())
     batch = make_grounded_batch()
-    batch[OBS_STATE][:, GRIPPER_INDEX_RAW] = 1.0
+    batch[OBS_STATE][:, GRIPPER_INDEX_RAW] = 0.0  # pre-grasp (state convention: 0=open)
     batch[ACTION][:, :, GRIPPER_INDEX_RAW] = 1.0
     batch[ACTION][:, -1, GRIPPER_INDEX_RAW] = -1.0
     with torch.no_grad():
