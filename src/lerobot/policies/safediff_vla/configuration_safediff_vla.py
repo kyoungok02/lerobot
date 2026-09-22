@@ -147,9 +147,15 @@ class SafeDiffVLAConfig(PreTrainedConfig):
     lambda_target: float = 1.0
     # Hidden width of `TargetPointHead`'s small MLP (mirrors `state_head_hidden_dim` above).
     target_head_hidden_dim: int = 256
-    # Gripper value strictly above this counts as "open" when extracting the GT grasp-target
-    # label from `action`'s gripper channel -- same `>threshold`==open convention used throughout
-    # this codebase (e.g. `examples/safediff_vla/place_phase_forensics.py`'s `GRIPPER_THRESHOLD`).
+    # RAW-physical-scale gripper decision boundary used when extracting the GT grasp-target label
+    # (see `utils.find_grasp_target`, `SafeDiffVLAPolicy._degrip_for_transition_detection`) --
+    # same convention used throughout this codebase (e.g.
+    # `examples/safediff_vla/place_phase_forensics.py`'s `GRIPPER_THRESHOLD`). Applied to
+    # `action`'s gripper channel with `>threshold`==open, and separately to `observation.state`'s
+    # gripper channel with `<threshold`==open -- these are NOT the same polarity, see
+    # `utils._action_gripper_is_open` / `utils._state_gripper_is_open`. Always un-normalized to
+    # raw physical units before this threshold is applied; never pass MEAN_STD-normalized values
+    # in directly, or this threshold silently miscalibrates.
     grounded_grasp_gripper_open_threshold: float = 0.5
     # Inference-only: physical distance (meters, robot-base frame) between the current EE
     # position (`observation.state[:3]`, un-normalized) and the predicted grasp target
@@ -160,6 +166,17 @@ class SafeDiffVLAConfig(PreTrainedConfig):
     # (`examples/safediff_vla/grasp_*_oracle*.py`) found actual contact typically within ~1-2cm
     # once xyz aim is corrected.
     grounded_grasp_close_threshold_m: float = 0.03
+    # Ablation switch (see `examples/safediff_vla/train_ablation_5k.py`): when True (default,
+    # unchanged existing behavior), `TargetPointHead`'s predicted xyz is fed into
+    # `TemporalActionDecoder` as global conditioning (`use_target_xyz`, see `temporal_decoder.py`).
+    # When False, `TargetPointHead` is still built and `lambda_target * loss_target` is still
+    # trained exactly the same way -- only the decoder's own conditioning input changes: it never
+    # sees the predicted target at all (`target_xyz=None` at both train and inference time,
+    # decoder built with `use_target_xyz=False`). Isolates "does an auxiliary grasp-target
+    # regression loss alone improve the pose trajectory" from "does conditioning the decoder on
+    # that prediction help or hurt" -- two independently toggleable effects that were previously
+    # coupled together under a single architecture. Has no effect on any other architecture.
+    grounded_grasp_condition_decoder_on_target: bool = True
 
     # Per-sample squared-L2 gap (in normalized state units) between what the subgoal predictor
     # expected `execute_horizon` steps after the previous chunk and the state actually observed
