@@ -12,6 +12,7 @@ ARCHITECTURES = {
     "temporal_decoder",
     "temporal_decoder_subgoal",
     "temporal_decoder_grounded_grasp",
+    "temporal_decoder_instruction",
 }
 
 
@@ -60,6 +61,17 @@ class SafeDiffVLAConfig(PreTrainedConfig):
     #       the predicted target (see `SafeDiffVLAPolicy._grounded_grasp_reactive_close`). No other
     #       architecture's behavior changes at all -- every new field/branch below is read only
     #       when `architecture == "temporal_decoder_grounded_grasp"`.
+    #   "temporal_decoder_instruction": experimental. `temporal_decoder` plus the instruction
+    #       itself added as one more global-conditioning term on every horizon query -- masked-mean
+    #       TEXT_MODALITY tokens (see `utils.masked_mean_by_modality`), projected and added
+    #       exactly like `subgoal_state`/`target_xyz` above (`temporal_decoder.py`'s
+    #       `use_instruction`). No `TargetPointHead`, no auxiliary loss, no decoder-conditioning
+    #       toggle, no reactive close -- the ONLY change from plain `temporal_decoder` is this one
+    #       additive term on the query. Exists to test whether the canonical decoder's own action
+    #       output can be made instruction-conditioned directly (bypassing the
+    #       `temporal_decoder_grounded_grasp` `TargetPointHead` path entirely, which held-out
+    #       xyz regression improved but never made the actual card selection track the
+    #       instruction -- identity-flip rate stayed 0-25% across two independent pooling designs).
     architecture: str = "temporal_decoder"
     n_obs_steps: int = 1
     # Must match the backbone's own native chunk size (`backbone.config.chunk_size` /
@@ -309,7 +321,13 @@ class SafeDiffVLAConfig(PreTrainedConfig):
         # the current pose, action the next commanded one), so this is a real constraint, not
         # an arbitrary one.
         if (
-            self.architecture in ("temporal_decoder", "temporal_decoder_subgoal", "temporal_decoder_grounded_grasp")
+            self.architecture
+            in (
+                "temporal_decoder",
+                "temporal_decoder_subgoal",
+                "temporal_decoder_grounded_grasp",
+                "temporal_decoder_instruction",
+            )
             and self.robot_state_feature.shape[0] != 7
         ):
             raise ValueError(

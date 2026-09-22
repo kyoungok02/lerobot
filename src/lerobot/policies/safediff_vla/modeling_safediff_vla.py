@@ -58,6 +58,7 @@ from .utils import (
     TEXT_MODALITY,
     compute_prefix_modality_ids,
     find_grasp_target,
+    masked_mean_by_modality,
     masked_mse,
     pad_or_crop_horizon,
     pad_or_crop_mask,
@@ -95,9 +96,15 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
         if config.freeze_backbone:
             self.backbone.requires_grad_(False)
 
-        if self.architecture in ("temporal_decoder", "temporal_decoder_subgoal", "temporal_decoder_grounded_grasp"):
+        if self.architecture in (
+            "temporal_decoder",
+            "temporal_decoder_subgoal",
+            "temporal_decoder_grounded_grasp",
+            "temporal_decoder_instruction",
+        ):
             use_subgoal = self.architecture == "temporal_decoder_subgoal"
             has_target_head = self.architecture == "temporal_decoder_grounded_grasp"
+            use_instruction = self.architecture == "temporal_decoder_instruction"
             # Ablation switch (`grounded_grasp_condition_decoder_on_target`, default True):
             # `TargetPointHead` (below) is built whenever this architecture is used, regardless of
             # this flag -- the auxiliary target-regression loss is always trainable. Only the
@@ -123,6 +130,7 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
                 dropout=config.decoder_dropout,
                 use_subgoal=use_subgoal,
                 use_target_xyz=use_target_xyz,
+                use_instruction=use_instruction,
             )
             if use_subgoal:
                 # `_pooled_latent`'s modality-aware pooling concatenates image/text-masked-mean +
@@ -548,7 +556,17 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
         # ablation-B path (auxiliary loss only, no conditioning) computes `target_xyz` for the loss
         # but the decoder itself never sees it.
         decoder_target_xyz = target_xyz if self.config.grounded_grasp_condition_decoder_on_target else None
-        pred_actions = self.decoder(latent_tokens, latent_pad_mask, current_state, subgoal_state, target_xyz=decoder_target_xyz)
+        instruction_embedding = None
+        if self.architecture == "temporal_decoder_instruction":
+            instruction_embedding = masked_mean_by_modality(latent_tokens, latent_pad_mask, latent_modality_ids, TEXT_MODALITY)
+        pred_actions = self.decoder(
+            latent_tokens,
+            latent_pad_mask,
+            current_state,
+            subgoal_state,
+            target_xyz=decoder_target_xyz,
+            instruction_embedding=instruction_embedding,
+        )
 
         # xyz MSE / rotation sin-cos MSE (6-D now) / gripper MSE, in the encoded 10-D layout --
         # see `rotation_encoding.py`.
@@ -618,7 +636,17 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
             # this method itself runs, i.e. chunk replans.
             self._grounded_grasp_last_target_xyz = target_xyz.detach()
         decoder_target_xyz = target_xyz if self.config.grounded_grasp_condition_decoder_on_target else None
-        actions_encoded = self.decoder(latent_tokens, latent_pad_mask, current_state, subgoal_state, target_xyz=decoder_target_xyz)
+        instruction_embedding = None
+        if self.architecture == "temporal_decoder_instruction":
+            instruction_embedding = masked_mean_by_modality(latent_tokens, latent_pad_mask, latent_modality_ids, TEXT_MODALITY)
+        actions_encoded = self.decoder(
+            latent_tokens,
+            latent_pad_mask,
+            current_state,
+            subgoal_state,
+            target_xyz=decoder_target_xyz,
+            instruction_embedding=instruction_embedding,
+        )
         # Unit-normalize each (sin, cos) pair and `atan2` back to raw Euler, right at this
         # policy's own output boundary -- everything downstream (`execution.ActionExecutor`, the
         # postprocessor, the VLABench env) keeps receiving the original 7-D layout unchanged.
@@ -636,7 +664,12 @@ class SafeDiffVLAPolicy(PreTrainedPolicy):
     def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict[str, float]]:
         if reduction != "mean":
             raise NotImplementedError("SafeDiff-VLA currently supports reduction='mean' only")
-        if self.architecture in ("temporal_decoder", "temporal_decoder_subgoal", "temporal_decoder_grounded_grasp"):
+        if self.architecture in (
+            "temporal_decoder",
+            "temporal_decoder_subgoal",
+            "temporal_decoder_grounded_grasp",
+            "temporal_decoder_instruction",
+        ):
             return self._forward_temporal_decoder(batch)
         if self.architecture == "smolvla_finetune":
             return self._forward_smolvla_finetune(batch)

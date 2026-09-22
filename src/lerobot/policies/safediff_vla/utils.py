@@ -8,6 +8,24 @@ STATE_MODALITY = 2
 OTHER_MODALITY = -1  # trailing zero-pad past the state token (only when `prefix_length` forces it)
 
 
+def masked_mean_by_modality(
+    latent_tokens: Tensor, latent_pad_mask: Tensor | None, latent_modality_ids: Tensor, modality: int
+) -> Tensor:
+    """Masked mean of `latent_tokens` `[B, N, D]` over positions tagged `modality` in
+    `latent_modality_ids` `[B, N]`, restricted to `latent_pad_mask`-valid positions (all-valid if
+    None). Returns `[B, D]`; a row with zero matching positions returns zeros (via the
+    `clamp_min(1)` denominator guard) rather than NaN. Used by
+    `architecture="temporal_decoder_instruction"` to pool the raw (un-grounded) TEXT_MODALITY
+    tokens into a single instruction embedding for `temporal_decoder.py`'s `use_instruction`
+    conditioning -- a standalone equivalent of the masked-mean closure `_pooled_latent` computes
+    inline for its own (image/text/state) pooling, not a refactor of it."""
+    if latent_pad_mask is None:
+        latent_pad_mask = latent_tokens.new_ones(latent_tokens.shape[:2], dtype=torch.bool)
+    valid = latent_pad_mask.to(torch.bool)
+    mask = ((latent_modality_ids == modality) & valid).unsqueeze(-1).to(latent_tokens.dtype)
+    return (latent_tokens * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1)
+
+
 def compute_prefix_modality_ids(prefix_att_masks: Tensor, lang_width: int) -> Tensor:
     """Per-token modality tag `[B, N]` (`IMAGE_MODALITY`/`TEXT_MODALITY`/`STATE_MODALITY`/
     `OTHER_MODALITY`) for `SmolVLAWithExpertModel.embed_prefix`'s prefix sequence, used by

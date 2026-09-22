@@ -185,6 +185,48 @@ def test_temporal_action_decoder_with_subgoal() -> None:
         decoder(latent_tokens, None, state, None)
 
 
+def test_temporal_action_decoder_with_instruction() -> None:
+    decoder = TemporalActionDecoder(
+        action_dim=ACTION_DIM,
+        state_dim=5,
+        latent_dim=12,
+        hidden_dim=16,
+        horizon=4,
+        num_layers=1,
+        num_heads=2,
+        ffn_dim=16,
+        dropout=0.0,
+        use_instruction=True,
+    )
+    latent_tokens = torch.randn(2, 6, 12)
+    state = torch.randn(2, 5)
+    instruction_embedding = torch.randn(2, 12)  # [B, latent_dim], not [B, state_dim]
+    actions = decoder(latent_tokens, None, state, instruction_embedding=instruction_embedding)
+    assert actions.shape == (2, 4, ACTION_DIM)
+    assert torch.isfinite(actions).all()
+    with pytest.raises(ValueError, match="use_instruction"):
+        decoder(latent_tokens, None, state, instruction_embedding=None)
+
+
+def test_instruction_embedding_conditioning_changes_decoder_output() -> None:
+    """Same latent tokens/state, different `instruction_embedding` -> different action chunk --
+    mirrors `test_predicted_target_xyz_conditioning_changes_decoder_output` in
+    `test_grounded_grasp.py` for the new additive conditioning term."""
+    decoder = TemporalActionDecoder(
+        action_dim=ACTION_DIM, state_dim=5, latent_dim=12, hidden_dim=16, horizon=4,
+        num_layers=1, num_heads=2, ffn_dim=16, dropout=0.0, use_instruction=True,
+    )
+    decoder.eval()
+    latent_tokens = torch.randn(2, 6, 12)
+    state = torch.randn(2, 5)
+    instruction_a = torch.randn(2, 12)
+    instruction_b = instruction_a + 5.0
+    with torch.no_grad():
+        out_a = decoder(latent_tokens, None, state, instruction_embedding=instruction_a)
+        out_b = decoder(latent_tokens, None, state, instruction_embedding=instruction_b)
+    assert not torch.allclose(out_a, out_b)
+
+
 def test_temporal_decoder_policy_trains_and_freezes_backbone() -> None:
     policy = make_policy(architecture="temporal_decoder")
     loss, metrics = policy(make_batch())
@@ -203,6 +245,56 @@ def test_temporal_decoder_subgoal_regresses_subgoal_label() -> None:
     assert metrics["loss_subgoal"] > 0
     loss.backward()
     assert any(parameter.grad is not None for parameter in policy.subgoal_state_predictor.parameters())
+
+
+def test_temporal_decoder_instruction_policy_trains_and_freezes_backbone() -> None:
+    policy = make_policy(architecture="temporal_decoder_instruction")
+    loss, metrics = policy(make_batch())
+    assert loss.ndim == 0 and torch.isfinite(loss)
+    assert metrics["loss_subgoal"] == 0 and metrics["loss_target"] == 0  # no subgoal/target head here
+    loss.backward()
+    assert all(parameter.grad is None for parameter in policy.backbone.parameters())
+    assert any(parameter.grad is not None for parameter in policy.decoder.instruction_encoder.parameters())
+
+
+def test_temporal_decoder_instruction_has_no_target_point_head_or_grounded_pooling() -> None:
+    """Regression guard: this architecture must not build any of the grounded-grasp-only modules
+    -- the only change from plain `temporal_decoder` is the decoder's own `instruction_encoder`."""
+    policy = make_policy(architecture="temporal_decoder_instruction")
+    assert not hasattr(policy, "target_point_head")
+    assert not hasattr(policy, "language_grounded_target_pooling")
+    assert not hasattr(policy, "modality_pool_projection")
+    assert policy.decoder.use_instruction is True
+    assert policy.decoder.use_subgoal is False
+    assert policy.decoder.use_target_xyz is False
+
+
+def test_temporal_decoder_and_subgoal_never_build_instruction_encoder() -> None:
+    """Regression guard the other direction: canonical `temporal_decoder` and
+    `temporal_decoder_subgoal` must never build `instruction_encoder` -- this is a new,
+    architecture-gated addition, not a change to existing paths."""
+    assert make_policy(architecture="temporal_decoder").decoder.use_instruction is False
+    assert make_policy(architecture="temporal_decoder_subgoal").decoder.use_instruction is False
+    assert not hasattr(make_policy(architecture="temporal_decoder").decoder, "instruction_encoder")
+
+
+def test_temporal_decoder_instruction_plan_action_chunk_shape() -> None:
+    policy = make_policy(architecture="temporal_decoder_instruction")
+    actions, metrics = policy.plan_action_chunk(make_batch())
+    assert actions.shape == (2, 4, ACTION_DIM)
+    assert torch.isfinite(actions).all()
+    assert "predicted_target_xyz" not in metrics
+    assert "predicted_subgoal_state" not in metrics
+
+
+def test_temporal_decoder_instruction_select_action_never_reactive_closes() -> None:
+    """`_grounded_grasp_reactive_close` is only ever invoked for
+    `architecture="temporal_decoder_grounded_grasp"` -- confirm `select_action` runs cleanly
+    without it for this architecture (reactive close OFF, by construction not by a toggle)."""
+    policy = make_policy(architecture="temporal_decoder_instruction")
+    action = policy.select_action(make_batch())
+    assert action.shape == (2, ACTION_DIM)
+    assert torch.isfinite(action).all()
 
 
 def test_temporal_decoder_smoothness_regularizer_is_off_by_default() -> None:

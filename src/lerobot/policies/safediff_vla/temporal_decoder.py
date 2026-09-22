@@ -73,11 +73,13 @@ class TemporalActionDecoder(nn.Module):
         dropout: float = 0.1,
         use_subgoal: bool = False,
         use_target_xyz: bool = False,
+        use_instruction: bool = False,
     ) -> None:
         super().__init__()
         self.horizon = horizon
         self.use_subgoal = use_subgoal
         self.use_target_xyz = use_target_xyz
+        self.use_instruction = use_instruction
         self.latent_projection = nn.Linear(latent_dim, hidden_dim)
         self.action_queries = nn.Parameter(torch.randn(horizon, hidden_dim) * 0.02)
         # Fixed (non-learnable) sin/cos position embedding, one per horizon slot. `action_queries`
@@ -97,6 +99,13 @@ class TemporalActionDecoder(nn.Module):
             # global-conditioning term, exactly mirroring how `subgoal_state` already works below.
             # `nn.TransformerDecoder`/`TransformerDecoderLayer` themselves are completely untouched.
             self.target_xyz_encoder = StateEncoder(3, hidden_dim)
+        if use_instruction:
+            # Same additive-global-conditioning pattern as `subgoal_state`/`target_xyz` above, just
+            # with an input width of `latent_dim` (the raw, un-projected masked-mean text-token
+            # pooling -- see `utils.masked_mean_by_modality` -- not `self.latent_projection`'s
+            # `hidden_dim`-wide output). `nn.TransformerDecoder`/`TransformerDecoderLayer`
+            # themselves are completely untouched; this only changes what gets added to `queries`.
+            self.instruction_encoder = StateEncoder(latent_dim, hidden_dim)
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=hidden_dim,
             nhead=num_heads,
@@ -115,6 +124,7 @@ class TemporalActionDecoder(nn.Module):
         current_state: Tensor,
         subgoal_state: Tensor | None = None,
         target_xyz: Tensor | None = None,
+        instruction_embedding: Tensor | None = None,
     ) -> Tensor:
         """
         Args:
@@ -130,6 +140,10 @@ class TemporalActionDecoder(nn.Module):
             target_xyz: [B, 3] predicted grasp-target xyz (see `target_point_head.py`'s
                 `TargetPointHead`) -- a single point, added as global conditioning to every query
                 position exactly like `subgoal_state`. Required iff `use_target_xyz=True`.
+            instruction_embedding: [B, latent_dim] raw (un-projected) masked-mean text-token
+                pooling (see `utils.masked_mean_by_modality`) -- added as global conditioning to
+                every query position exactly like `subgoal_state`/`target_xyz`. Required iff
+                `use_instruction=True`.
 
         Returns: action trajectory [B, H, action_dim].
         """
@@ -137,6 +151,8 @@ class TemporalActionDecoder(nn.Module):
             raise ValueError("This decoder was built with use_subgoal=True but got none.")
         if self.use_target_xyz and target_xyz is None:
             raise ValueError("This decoder was built with use_target_xyz=True but got none.")
+        if self.use_instruction and instruction_embedding is None:
+            raise ValueError("This decoder was built with use_instruction=True but got none.")
         batch_size = latent_tokens.shape[0]
         memory = self.latent_projection(latent_tokens)
         memory_key_padding_mask = None if latent_pad_mask is None else ~latent_pad_mask
@@ -147,6 +163,8 @@ class TemporalActionDecoder(nn.Module):
             queries = queries + self.subgoal_encoder(subgoal_state)[:, None, :]
         if self.use_target_xyz:
             queries = queries + self.target_xyz_encoder(target_xyz)[:, None, :]
+        if self.use_instruction:
+            queries = queries + self.instruction_encoder(instruction_embedding)[:, None, :]
 
         decoded = self.transformer(
             tgt=queries, memory=memory, memory_key_padding_mask=memory_key_padding_mask
