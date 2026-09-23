@@ -359,11 +359,16 @@ def test_v2_queue_clear_forces_full_replan_on_next_select_action_call() -> None:
     policy.eval()
     policy.reset()
     batch = make_grounded_batch(batch_size=1)
-    batch[OBS_STATE][:, :3] = 0.0
+    # Deliberately far from wherever the randomly-initialized target_point_head happens to
+    # predict, so this first call's own proximity check can never accidentally trigger (RNG-order
+    # dependent otherwise -- a real, if unlikely, flake, not a hypothetical one).
+    batch[OBS_STATE][:, :3] = 1000.0
 
     policy.select_action(batch)  # commits a fresh chunk; queue now has execute_horizon-1 left
     assert len(policy._executor._action_queue) == policy.config.execute_horizon - 1
+    assert policy._v2_close_triggered is False
 
+    batch[OBS_STATE][:, :3] = 0.0
     policy._v2_last_target_xyz = torch.zeros(1, 3)  # force the trigger on the very next call
     policy.select_action(batch)
     # The trigger clears the queue INSIDE this call, after the executor already popped one action
