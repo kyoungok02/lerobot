@@ -92,8 +92,11 @@ def extract_physics_record(env: VLABenchEnvImpl, step_ix: int) -> dict[str, Any]
     task = env._env.task
     robot = task.robot
     target_name = task.target_entity
-    base = robot_base(env)
-    ee_pos = np.asarray(robot.get_end_effector_pos(physics), dtype=float) - base
+    # WORLD frame throughout (matches `all_card_positions`'s own `ent.get_xpos(physics)`, which
+    # is not base-relative) -- the policy's own cached predicted target is converted from its
+    # robot-base-relative frame to WORLD via `+base` at the one place it's compared against these
+    # (`merge_policy_log`), not here.
+    ee_pos = np.asarray(robot.get_end_effector_pos(physics), dtype=float)
     cards = all_card_positions(env)
     card_pos = np.array(cards.get(target_name, [np.nan, np.nan, np.nan]))
     try:
@@ -166,7 +169,7 @@ def install_env_instrumentation(policy_log: list[dict]) -> dict:
     orig_reset = cls.reset
     state: dict[str, Any] = {"current_episode_steps": []}
 
-    def merge_policy_log(record: dict) -> None:
+    def merge_policy_log(record: dict, base: np.ndarray) -> None:
         if not policy_log:
             record["original_decoder_gripper"] = None
             record["applied_gripper"] = None
@@ -185,13 +188,13 @@ def install_env_instrumentation(policy_log: list[dict]) -> dict:
         record["phase_after_this_step"] = p["phase_after"]
         record["close_triggered_after_this_step"] = p["close_triggered_after"]
         record["proximity_trigger_fired_this_step"] = p["just_triggered_this_step"]
-        # `extract_physics_record` already subtracts the robot base from ee_pos/card_pos/
-        # all_card_positions -- the cached predicted target (un-normalized via `action_pos_std/
-        # mean` in `_grounded_grasp_v2_reactive_close`) is ALSO already in that same
-        # robot-base-relative frame, so no base offset is needed here; comparing both directly
-        # keeps everything in one consistent frame.
+        # `extract_physics_record`'s `ee_pos`/`card_pos`/`all_card_positions` are WORLD frame
+        # (`ent.get_xpos(physics)`, un-shifted). The cached predicted target is in the policy's
+        # own robot-BASE-relative frame (un-normalized via `action_pos_std/mean` in
+        # `_grounded_grasp_v2_reactive_close`, the same frame `observation.state[:3]`/`action[:3]`
+        # use) -- `+base` converts it to WORLD frame so it can be compared against the other two.
         if p["predicted_target_robot_frame"] is not None:
-            predicted_target_world = np.asarray(p["predicted_target_robot_frame"], dtype=float)
+            predicted_target_world = np.asarray(p["predicted_target_robot_frame"], dtype=float) + base
             card_pos = np.asarray(record["card_pos"], dtype=float)
             ee_pos = np.asarray(record["ee_pos"], dtype=float)
             record["predicted_target_world"] = predicted_target_world.tolist()
@@ -215,7 +218,7 @@ def install_env_instrumentation(policy_log: list[dict]) -> dict:
         result = orig_reset(self, seed=seed, **kwargs)
         if seed is not None:
             record = extract_physics_record(self, step_ix=0)
-            merge_policy_log(record)
+            merge_policy_log(record, robot_base(self))
             state["current_episode_steps"] = [record]
         return result
 
@@ -225,7 +228,7 @@ def install_env_instrumentation(policy_log: list[dict]) -> dict:
         if not terminated:
             step_ix = len(state["current_episode_steps"])
             record = extract_physics_record(self, step_ix=step_ix)
-            merge_policy_log(record)
+            merge_policy_log(record, robot_base(self))
             state["current_episode_steps"].append(record)
         return result
 
