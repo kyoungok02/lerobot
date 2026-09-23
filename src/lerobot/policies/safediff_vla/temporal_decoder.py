@@ -77,6 +77,7 @@ class TemporalActionDecoder(nn.Module):
         use_target_xyz: bool = False,
         use_instruction: bool = False,
         use_text_crossattn: bool = False,
+        use_grounded_grasp_v2: bool = False,
     ) -> None:
         super().__init__()
         self.horizon = horizon
@@ -84,6 +85,7 @@ class TemporalActionDecoder(nn.Module):
         self.use_target_xyz = use_target_xyz
         self.use_instruction = use_instruction
         self.use_text_crossattn = use_text_crossattn
+        self.use_grounded_grasp_v2 = use_grounded_grasp_v2
         self.latent_projection = nn.Linear(latent_dim, hidden_dim)
         self.action_queries = nn.Parameter(torch.randn(horizon, hidden_dim) * 0.02)
         # Fixed (non-learnable) sin/cos position embedding, one per horizon slot. `action_queries`
@@ -110,6 +112,16 @@ class TemporalActionDecoder(nn.Module):
             # `hidden_dim`-wide output). `nn.TransformerDecoder`/`TransformerDecoderLayer`
             # themselves are completely untouched; this only changes what gets added to `queries`.
             self.instruction_encoder = StateEncoder(latent_dim, hidden_dim)
+        if use_grounded_grasp_v2:
+            # Two MORE additive global-conditioning terms, same pattern as above, on top of
+            # `target_xyz_encoder` (built by `use_target_xyz` -- callers set both flags together
+            # for this architecture, see `modeling_safediff_vla.py`): `grounded_target_feature`
+            # (from `grounded_grasp_v2.py`'s `VisualGroundingCrossAttention`, `latent_dim`-wide,
+            # same as `instruction_encoder`'s input) and a binary grasp-phase embedding
+            # (0=PRE_GRASP, 1=POST_GRASP). `nn.TransformerDecoder`/`TransformerDecoderLayer`
+            # themselves are, again, completely untouched.
+            self.grounded_feature_encoder = StateEncoder(latent_dim, hidden_dim)
+            self.phase_encoder = nn.Embedding(2, hidden_dim)
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=hidden_dim,
             nhead=num_heads,
@@ -142,6 +154,8 @@ class TemporalActionDecoder(nn.Module):
         target_xyz: Tensor | None = None,
         instruction_embedding: Tensor | None = None,
         latent_modality_ids: Tensor | None = None,
+        grounded_target_feature: Tensor | None = None,
+        grasp_phase: Tensor | None = None,
     ) -> Tensor:
         """
         Args:
@@ -164,6 +178,13 @@ class TemporalActionDecoder(nn.Module):
             latent_modality_ids: [B, N_tokens] int modality tag per `latent_tokens` position (see
                 `utils.compute_prefix_modality_ids`) -- used only to restrict the extra text-only
                 cross-attention to TEXT_MODALITY positions. Required iff `use_text_crossattn=True`.
+            grounded_target_feature: [B, latent_dim] (see `grounded_grasp_v2.py`'s
+                `VisualGroundingCrossAttention`) -- added as global conditioning to every query
+                position exactly like `subgoal_state`/`target_xyz`/`instruction_embedding`.
+                Required iff `use_grounded_grasp_v2=True`.
+            grasp_phase: [B] long, 0=PRE_GRASP / 1=POST_GRASP -- embedded and added as global
+                conditioning exactly like the other terms above. Required iff
+                `use_grounded_grasp_v2=True`.
 
         Returns: action trajectory [B, H, action_dim].
         """
@@ -175,6 +196,11 @@ class TemporalActionDecoder(nn.Module):
             raise ValueError("This decoder was built with use_instruction=True but got none.")
         if self.use_text_crossattn and latent_modality_ids is None:
             raise ValueError("This decoder was built with use_text_crossattn=True but got no latent_modality_ids.")
+        if self.use_grounded_grasp_v2 and (grounded_target_feature is None or grasp_phase is None):
+            raise ValueError(
+                "This decoder was built with use_grounded_grasp_v2=True but got no "
+                "grounded_target_feature and/or grasp_phase."
+            )
         batch_size = latent_tokens.shape[0]
         memory = self.latent_projection(latent_tokens)
         memory_key_padding_mask = None if latent_pad_mask is None else ~latent_pad_mask
@@ -187,6 +213,9 @@ class TemporalActionDecoder(nn.Module):
             queries = queries + self.target_xyz_encoder(target_xyz)[:, None, :]
         if self.use_instruction:
             queries = queries + self.instruction_encoder(instruction_embedding)[:, None, :]
+        if self.use_grounded_grasp_v2:
+            queries = queries + self.grounded_feature_encoder(grounded_target_feature)[:, None, :]
+            queries = queries + self.phase_encoder(grasp_phase)[:, None, :]
 
         decoded = self.transformer(
             tgt=queries, memory=memory, memory_key_padding_mask=memory_key_padding_mask
