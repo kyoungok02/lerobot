@@ -1,36 +1,33 @@
 #!/usr/bin/env python
-"""Closed-loop rollout evaluation of the fresh `train_grounded_grasp_v2_5k.py` checkpoint
-(`temporal_decoder_grounded_grasp_v2`) on `select_poker` seeds 1000-1002. Self-contained: reads
-live MuJoCo physics via a non-invasive `VLABenchEnv.step`/`.reset` monkeypatch (same pattern as
-every prior rollout script this session), plus an instance-level wrap of this one policy object's
-own `_grounded_grasp_v2_reactive_close` (observes, does not change, its already-implemented
-proximity-trigger/phase-flip/one-shot-guard behavior and the decoder's raw pre-override gripper
-channel). No model/loss/execution-policy code is touched by this script.
+"""Closed-loop rollout evaluation of the canonical `architecture="temporal_decoder"` (sin/cos +
+padfix, no grounded-grasp machinery of any kind) checkpoint, using the SAME physics
+instrumentation and per-episode metrics as `eval_grounded_grasp_v2_5k.py`, for a direct comparison
+against `temporal_decoder_grounded_grasp_v2` on identical held-out rollout seeds. No
+architecture/loss/execution code is touched by this script.
 
-Per episode, records:
-  - task success (the env's own success condition, via `eval_policy`).
-  - grasp/contact success (`entity.is_grasped(physics, robot)` on the REAL target card -- ground
-    truth, independent of the model).
-  - target card identity, predicted target xyz, actual target card xyz, predicted<->GT distance,
-    nearest-card-to-predicted-target identity, and target_is_nearest -- each at three reference
-    steps: the first chunk, the proximity-close-trigger step, and the step of minimum EE<->target
-    distance (mirrors the fields the earlier `eval_grounded_grasp_5k.py`/`grasp_approach_precision_
-    *.py` diagnostics used, for direct comparability).
-  - proximity close trigger timestep, the decoder's OWN raw predicted close timestep (before the
-    reactive-close override -- "original_decoder_close_step"), and the PRE_GRASP->POST_GRASP phase
-    transition timestep (by construction the same step as the proximity trigger, tracked
-    independently here to confirm that).
-  - min EE<->target-card distance over the whole episode.
-  - video path.
+This architecture has no `TargetPointHead`, no reactive close, no grasp-phase conditioning -- "the
+predicted target" is read off the decoder's own predicted action-chunk trajectory instead (the
+first step the postprocessed gripper channel crosses closed, falling back to the chunk's last-step
+xyz if it never closes), exactly `instruction_counterfactual_audit.py`'s convention for a
+checkpoint with no explicit target head. This is captured once per fresh chunk plan (an
+instance-level wrap of `plan_action_chunk`, read-only -- observes, does not change, its output)
+and held constant for every step until the next chunk is planned, mirroring how
+`temporal_decoder_grounded_grasp_v2`'s reactive-close mechanism caches its own last prediction.
 
-"wrong_object_grounding" (comparable to the baseline's reported 6/10): counted BOTH at the episode's
-minimum-EE-distance step (arguably the most decision-relevant "closest approach" moment) and as
-"nearest-target a minority of steps" (`fraction_steps_target_is_nearest < 0.5`) -- both from the
-same underlying `target_is_nearest` per-step signal, reported explicitly so either definition can
-be checked against whatever the baseline used.
+Fields with no equivalent for this architecture (proximity_trigger_step, post_grasp_phase_
+transition_step) are always None -- reported explicitly, not omitted, so the comparison script can
+tell "not applicable" apart from "did not occur".
+
+Default checkpoint is `safediff_vla_temporal_decoder_padfix_20k` -- the canonical sin/cos+padfix
+`temporal_decoder` 20k run already used as the reference baseline elsewhere in this codebase (e.g.
+`instruction_counterfactual_audit.py`). NOT `safediff_vla_temporal_decoder_v2_baseline_20k`, despite
+its name: that checkpoint's `decoder.state_encoder`/`action_head` are shaped for the raw 7-D
+layout (pre-sin/cos-encoding), so loading it into the current `TemporalActionDecoder`
+(ENCODED_DIM=10) fails a state_dict shape check outright -- confirmed by actually trying.
 
 Usage:
-    MUJOCO_GL=egl uv run python examples/safediff_vla/eval_grounded_grasp_v2_5k.py
+    MUJOCO_GL=egl uv run python examples/safediff_vla/eval_temporal_decoder_baseline_holdout.py \
+        --seeds 2000 2001 2002 2003 2004 2005 2006 2007 2008 2009
 """
 
 from __future__ import annotations
@@ -57,7 +54,7 @@ from lerobot.utils.random_utils import set_seed
 logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout, force=True)
 logger = logging.getLogger(__name__)
 
-CHECKPOINT = "outputs/train/safediff_vla_grounded_grasp_v2_5k/checkpoints/005000/pretrained_model"
+CHECKPOINT = "outputs/train/safediff_vla_temporal_decoder_padfix_20k/checkpoints/020000/pretrained_model"
 TASK = "select_poker"
 RENAME_MAP = {
     "observation.images.image": "observation.images.camera1",
@@ -65,7 +62,7 @@ RENAME_MAP = {
     "observation.images.wrist_image": "observation.images.camera3",
 }
 GRIPPER_THRESHOLD = 0.5
-SEEDS = [1000, 1001, 1002]
+SEEDS = list(range(2000, 2010))
 
 
 def robot_base(env: VLABenchEnvImpl) -> np.ndarray:
@@ -92,10 +89,9 @@ def extract_physics_record(env: VLABenchEnvImpl, step_ix: int) -> dict[str, Any]
     task = env._env.task
     robot = task.robot
     target_name = task.target_entity
-    # WORLD frame throughout (matches `all_card_positions`'s own `ent.get_xpos(physics)`, which
-    # is not base-relative) -- the policy's own cached predicted target is converted from its
-    # robot-base-relative frame to WORLD via `+base` at the one place it's compared against these
-    # (`merge_policy_log`), not here.
+    # WORLD frame throughout (matches `all_card_positions`'s own `ent.get_xpos(physics)`) -- the
+    # policy's own cached predicted target is converted from robot-base-relative to WORLD via
+    # `+base` at the one place it's compared against these (`merge_policy_log`), not here.
     ee_pos = np.asarray(robot.get_end_effector_pos(physics), dtype=float)
     cards = all_card_positions(env)
     card_pos = np.array(cards.get(target_name, [np.nan, np.nan, np.nan]))
@@ -124,43 +120,33 @@ def extract_physics_record(env: VLABenchEnvImpl, step_ix: int) -> dict[str, Any]
     }
 
 
-def install_policy_instrumentation(policy: SafeDiffVLAPolicy) -> dict:
-    """Instance-level wrap (not a class patch) of this one policy's own
-    `_grounded_grasp_v2_reactive_close` -- observes (doesn't change) its already-implemented
-    proximity-trigger/phase-flip/one-shot-guard behavior, plus the decoder's raw pre-override
-    gripper channel."""
-    orig = SafeDiffVLAPolicy._grounded_grasp_v2_reactive_close
+def install_policy_instrumentation(policy: SafeDiffVLAPolicy, postprocessor) -> dict:
+    """Instance-level wrap (not a class patch) of this one policy's own `plan_action_chunk` --
+    observes (doesn't change) its output. Captures, once per fresh chunk plan: the postprocessed
+    (physical-units) gripper-crossing xyz (the "predicted target" proxy for an architecture with
+    no explicit target head), robot-base-relative (converted to WORLD frame later, in
+    `merge_policy_log`, exactly like `_v2_last_target_xyz`'s cached value)."""
+    orig = SafeDiffVLAPolicy.plan_action_chunk
     log: list[dict] = []
 
-    def wrapped(self, action, current_state):
-        original_gripper = float(action[0, GRIPPER_INDEX_RAW].item())
-        phase_before = self._v2_grasp_phase
-        was_triggered_before = self._v2_close_triggered
-        predicted_target_world = None
-        if self._v2_last_target_xyz is not None:
-            target_pos_m = self._v2_last_target_xyz * self.action_pos_std + self.action_pos_mean
-            predicted_target_world = target_pos_m[0].detach().cpu().numpy()  # robot-base frame
-        result = orig(self, action, current_state)
-        log.append(
-            {
-                "original_gripper": original_gripper,
-                "final_gripper": float(result[0, GRIPPER_INDEX_RAW].item()),
-                "phase_before": phase_before,
-                "phase_after": self._v2_grasp_phase,
-                "close_triggered_after": bool(self._v2_close_triggered),
-                "just_triggered_this_step": bool((not was_triggered_before) and self._v2_close_triggered),
-                "predicted_target_robot_frame": predicted_target_world.tolist() if predicted_target_world is not None else None,
-            }
-        )
-        return result
+    def wrapped(self, batch):
+        actions, metrics = orig(self, batch)
+        with torch.no_grad():
+            actions_physical = postprocessor(actions[0].clone()).cpu().numpy()  # [H, 7], physical units
+        gripper = actions_physical[:, GRIPPER_INDEX_RAW]
+        closed = gripper <= GRIPPER_THRESHOLD
+        close_idx = int(np.argmax(closed)) if closed.any() else None
+        close_xyz = actions_physical[close_idx, :3] if close_idx is not None else actions_physical[-1, :3]
+        log.append({"predicted_target_robot_frame": close_xyz.tolist(), "chunk_close_idx": close_idx})
+        return actions, metrics
 
-    policy._grounded_grasp_v2_reactive_close = wrapped.__get__(policy, SafeDiffVLAPolicy)
+    policy.plan_action_chunk = wrapped.__get__(policy, SafeDiffVLAPolicy)
     return {"log": log, "_original": orig}
 
 
 def uninstall_policy_instrumentation(policy: SafeDiffVLAPolicy) -> None:
-    if "_grounded_grasp_v2_reactive_close" in policy.__dict__:
-        del policy.__dict__["_grounded_grasp_v2_reactive_close"]
+    if "plan_action_chunk" in policy.__dict__:
+        del policy.__dict__["plan_action_chunk"]
 
 
 def install_env_instrumentation(policy_log: list[dict]) -> dict:
@@ -171,11 +157,7 @@ def install_env_instrumentation(policy_log: list[dict]) -> dict:
 
     def merge_policy_log(record: dict, base: np.ndarray) -> None:
         if not policy_log:
-            record["original_decoder_gripper"] = None
-            record["applied_gripper"] = None
-            record["phase_after_this_step"] = 0
-            record["close_triggered_after_this_step"] = False
-            record["proximity_trigger_fired_this_step"] = False
+            record["chunk_close_idx"] = None
             record["predicted_target_world"] = None
             record["predicted_target_dist_to_gt_card"] = None
             record["ee_to_predicted_target_dist"] = None
@@ -183,36 +165,20 @@ def install_env_instrumentation(policy_log: list[dict]) -> dict:
             record["target_is_nearest"] = None
             return
         p = policy_log[-1]
-        record["original_decoder_gripper"] = p["original_gripper"]
-        record["applied_gripper"] = p["final_gripper"]
-        record["phase_after_this_step"] = p["phase_after"]
-        record["close_triggered_after_this_step"] = p["close_triggered_after"]
-        record["proximity_trigger_fired_this_step"] = p["just_triggered_this_step"]
-        # `extract_physics_record`'s `ee_pos`/`card_pos`/`all_card_positions` are WORLD frame
-        # (`ent.get_xpos(physics)`, un-shifted). The cached predicted target is in the policy's
-        # own robot-BASE-relative frame (un-normalized via `action_pos_std/mean` in
-        # `_grounded_grasp_v2_reactive_close`, the same frame `observation.state[:3]`/`action[:3]`
-        # use) -- `+base` converts it to WORLD frame so it can be compared against the other two.
-        if p["predicted_target_robot_frame"] is not None:
-            predicted_target_world = np.asarray(p["predicted_target_robot_frame"], dtype=float) + base
-            card_pos = np.asarray(record["card_pos"], dtype=float)
-            ee_pos = np.asarray(record["ee_pos"], dtype=float)
-            record["predicted_target_world"] = predicted_target_world.tolist()
-            record["predicted_target_dist_to_gt_card"] = float(np.linalg.norm(predicted_target_world - card_pos))
-            record["ee_to_predicted_target_dist"] = float(np.linalg.norm(ee_pos - predicted_target_world))
-            dists = {
-                name: float(np.linalg.norm(predicted_target_world - np.asarray(pos, dtype=float)))
-                for name, pos in record["all_card_positions"].items()
-            }
-            nearest = min(dists, key=dists.get) if dists else None
-            record["nearest_card_to_predicted_target"] = nearest
-            record["target_is_nearest"] = nearest == record["target_entity"]
-        else:
-            record["predicted_target_world"] = None
-            record["predicted_target_dist_to_gt_card"] = None
-            record["ee_to_predicted_target_dist"] = None
-            record["nearest_card_to_predicted_target"] = None
-            record["target_is_nearest"] = None
+        record["chunk_close_idx"] = p["chunk_close_idx"]
+        predicted_target_world = np.asarray(p["predicted_target_robot_frame"], dtype=float) + base
+        card_pos = np.asarray(record["card_pos"], dtype=float)
+        ee_pos = np.asarray(record["ee_pos"], dtype=float)
+        record["predicted_target_world"] = predicted_target_world.tolist()
+        record["predicted_target_dist_to_gt_card"] = float(np.linalg.norm(predicted_target_world - card_pos))
+        record["ee_to_predicted_target_dist"] = float(np.linalg.norm(ee_pos - predicted_target_world))
+        dists = {
+            name: float(np.linalg.norm(predicted_target_world - np.asarray(pos, dtype=float)))
+            for name, pos in record["all_card_positions"].items()
+        }
+        nearest = min(dists, key=dists.get) if dists else None
+        record["nearest_card_to_predicted_target"] = nearest
+        record["target_is_nearest"] = nearest == record["target_entity"]
 
     def patched_reset(self, seed=None, **kwargs):
         result = orig_reset(self, seed=seed, **kwargs)
@@ -248,15 +214,7 @@ def summarize_episode(steps: list[dict], seed: int, success: bool, episode_len: 
     grasp_success = any(s["is_grasped"] for s in steps)
     wrong_object_grasped_ever = any(s.get("wrong_object_grasped_this_step") for s in steps)
 
-    orig_close_step = next(
-        (s["step_ix"] for s in steps[1:] if s.get("original_decoder_gripper") is not None and s["original_decoder_gripper"] <= GRIPPER_THRESHOLD),
-        None,
-    )
-    proximity_trigger_step = next((s["step_ix"] for s in steps if s.get("proximity_trigger_fired_this_step")), None)
-    phase_transition_step = next(
-        (s["step_ix"] for s in steps if s.get("phase_after_this_step") == 1 and steps[max(s["step_ix"] - 1, 0)].get("phase_after_this_step") == 0),
-        None,
-    )
+    orig_close_step = next((s["step_ix"] for s in steps if s.get("chunk_close_idx") is not None), None)
 
     min_idx = min(range(len(steps)), key=lambda i: steps[i]["ee_to_card_dist"])
     min_step = steps[min_idx]
@@ -303,13 +261,14 @@ def summarize_episode(steps: list[dict], seed: int, success: bool, episode_len: 
         "target_card_identity": steps[0]["target_entity"],
         "episode_len": episode_len,
         "original_decoder_close_step": orig_close_step,
-        "proximity_trigger_step": proximity_trigger_step,
-        "post_grasp_phase_transition_step": phase_transition_step,
-        "phase_transition_matches_proximity_trigger": phase_transition_step == proximity_trigger_step,
+        # No equivalent for this architecture (no reactive close / no phase) -- reported
+        # explicitly as None rather than omitted, so the comparison script can tell
+        # "not applicable" apart from "did not occur".
+        "proximity_trigger_step": None,
+        "post_grasp_phase_transition_step": None,
         "episode_min_ee_to_card_dist": min_step["ee_to_card_dist"],
         "episode_min_dist_step_ix": min_step["step_ix"],
         "at_first_chunk": ref(1),
-        "at_proximity_trigger": ref(proximity_trigger_step),
         "at_min_distance": ref(min_step["step_ix"]),
         "fraction_steps_target_is_nearest": frac_target_is_nearest,
         "wrong_object_grounding_at_min_distance": (
@@ -324,8 +283,8 @@ def summarize_episode(steps: list[dict], seed: int, success: bool, episode_len: 
     }
 
 
-def run(policy: SafeDiffVLAPolicy, device: str, seeds: list[int], out_dir: Path) -> None:
-    assert policy.config.architecture == "temporal_decoder_grounded_grasp_v2"
+def run(policy: SafeDiffVLAPolicy, device: str, seeds: list[int], out_dir: Path, checkpoint: str) -> None:
+    assert policy.config.architecture == "temporal_decoder"
     assert policy.config.use_temporal_ensembling is False
     set_seed(seeds[0])
 
@@ -334,7 +293,7 @@ def run(policy: SafeDiffVLAPolicy, device: str, seeds: list[int], out_dir: Path)
     env = envs[TASK][0]
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=policy.config,
-        pretrained_path=CHECKPOINT,
+        pretrained_path=checkpoint,
         preprocessor_overrides={
             "device_processor": {"device": device},
             "rename_observations_processor": {"rename_map": RENAME_MAP},
@@ -342,7 +301,7 @@ def run(policy: SafeDiffVLAPolicy, device: str, seeds: list[int], out_dir: Path)
     )
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=env_cfg, policy_cfg=policy.config)
 
-    policy_inst = install_policy_instrumentation(policy)
+    policy_inst = install_policy_instrumentation(policy, postprocessor)
     env_state = install_env_instrumentation(policy_inst["log"])
     episode_records: list[dict] = []
     videos_dir = out_dir / "videos"
@@ -386,8 +345,9 @@ def run(policy: SafeDiffVLAPolicy, device: str, seeds: list[int], out_dir: Path)
     ]
 
     summary = {
-        "checkpoint": CHECKPOINT,
+        "checkpoint": checkpoint,
         "task": TASK,
+        "architecture": "temporal_decoder",
         "n_episodes": len(seeds),
         "seeds": seeds,
         "per_episode": per_episode_summary,
@@ -402,9 +362,6 @@ def run(policy: SafeDiffVLAPolicy, device: str, seeds: list[int], out_dir: Path)
             "n_wrong_object_grounding_majority_of_steps": sum(
                 1 for e in per_episode_summary if e["wrong_object_grounding_majority_of_steps"]
             ),
-            "n_phase_transition_matches_proximity_trigger": sum(
-                1 for e in per_episode_summary if e["phase_transition_matches_proximity_trigger"]
-            ),
         },
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
@@ -413,21 +370,19 @@ def run(policy: SafeDiffVLAPolicy, device: str, seeds: list[int], out_dir: Path)
 
 
 def main() -> None:
-    global CHECKPOINT
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--checkpoint", default=CHECKPOINT)
     parser.add_argument("--seeds", type=int, nargs="+", default=SEEDS)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--output-dir", default="outputs/eval/safediff_vla_grounded_grasp_v2_5k")
+    parser.add_argument("--output-dir", default="outputs/eval/safediff_vla_temporal_decoder_baseline_holdout")
     args = parser.parse_args()
-    CHECKPOINT = args.checkpoint
 
-    logger.info("=== loading temporal_decoder_grounded_grasp_v2 checkpoint from %s ===", CHECKPOINT)
-    policy = SafeDiffVLAPolicy.from_pretrained(CHECKPOINT)
+    logger.info("=== loading temporal_decoder checkpoint from %s ===", args.checkpoint)
+    policy = SafeDiffVLAPolicy.from_pretrained(args.checkpoint)
     policy = policy.to(args.device)
     policy.eval()
 
-    run(policy, args.device, args.seeds, Path(args.output_dir))
+    run(policy, args.device, args.seeds, Path(args.output_dir), args.checkpoint)
 
 
 if __name__ == "__main__":
