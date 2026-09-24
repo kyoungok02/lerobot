@@ -11,6 +11,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from lerobot.policies.safediff_vla.language_grounded_target_pooling import LanguageGroundedTargetPooling
 from lerobot.policies.safediff_vla.modeling_safediff_vla import SafeDiffVLAPolicy
 from lerobot.policies.safediff_vla.rotation_encoding import GRIPPER_INDEX_RAW
 from lerobot.policies.safediff_vla.target_point_head import TargetPointHead
@@ -174,7 +175,8 @@ def test_compute_prefix_modality_ids_trailing_padding_is_other_not_image_or_text
     assert modality_ids[0, 5:].tolist() == [OTHER_MODALITY, OTHER_MODALITY, OTHER_MODALITY]
 
 
-# ---- _pooled_latent: modality-aware pooling --------------------------------------------------
+# ---- _pooled_latent: modality-aware pooling (subgoal path only -- the grounded-grasp target
+# head has its own `LanguageGroundedTargetPooling` instead, see the section below) -------------
 
 
 def _build_modality_batch(image_tokens: torch.Tensor, text_tokens: torch.Tensor, state_token: torch.Tensor):
@@ -196,11 +198,14 @@ def _build_modality_batch(image_tokens: torch.Tensor, text_tokens: torch.Tensor,
 
 
 def _make_average_projection_policy(latent_dim: int = 12) -> SafeDiffVLAPolicy:
-    """A `temporal_decoder_grounded_grasp` policy with `modality_pool_projection` forced to
-    `(image_pooled + text_pooled + state_token) / 3` -- a simple, deterministic, exactly-known
-    instantiation of "concat + projection" so pooling-sensitivity comparisons below don't depend
-    on a randomly-initialized projection's own scaling."""
-    policy = make_policy(architecture=ARCH)
+    """A `temporal_decoder_subgoal` policy (the one remaining architecture that builds
+    `modality_pool_projection`/`_pooled_latent` -- `temporal_decoder_grounded_grasp`'s target head
+    uses `LanguageGroundedTargetPooling` instead, tested separately below) with
+    `modality_pool_projection` forced to `(image_pooled + text_pooled + state_token) / 3` -- a
+    simple, deterministic, exactly-known instantiation of "concat + projection" so
+    pooling-sensitivity comparisons below don't depend on a randomly-initialized projection's own
+    scaling."""
+    policy = make_policy(architecture="temporal_decoder_subgoal")
     with torch.no_grad():
         identity_blocks = torch.cat([torch.eye(latent_dim)] * 3, dim=1) / 3
         policy.modality_pool_projection.weight.copy_(identity_blocks)
@@ -209,7 +214,7 @@ def _make_average_projection_policy(latent_dim: int = 12) -> SafeDiffVLAPolicy:
 
 
 def test_pooled_latent_shape_and_gradient() -> None:
-    policy = make_policy(architecture=ARCH)
+    policy = make_policy(architecture="temporal_decoder_subgoal")
     d = policy._multimodal_latent_dim()
     image_tokens = torch.randn(3, 40, d, requires_grad=True)
     text_tokens = torch.randn(3, 5, d, requires_grad=True)
@@ -230,7 +235,7 @@ def test_pooled_latent_shape_and_gradient() -> None:
 def test_pooled_latent_is_finite_when_a_modality_has_no_valid_tokens() -> None:
     """Every text token masked out (`latent_pad_mask=0` there) must not produce NaN/Inf -- the
     `clamp_min(1)` denominator guard must actually be exercised, not just present."""
-    policy = make_policy(architecture=ARCH)
+    policy = make_policy(architecture="temporal_decoder_subgoal")
     d = policy._multimodal_latent_dim()
     image_tokens = torch.randn(2, 10, d)
     text_tokens = torch.randn(2, 4, d)
@@ -338,6 +343,121 @@ def test_pooled_latent_far_more_sensitive_to_text_change_than_old_all_token_mean
 
     # Analytically: new_delta = 50/3 per dim, old_delta = 3*50/(40+3+1) per dim -> ratio ~4.9x.
     assert new_delta > old_delta * 3
+
+
+# ---- LanguageGroundedTargetPooling: text-queried cross-attention over image tokens -----------
+# (grounded-grasp target head only -- `_predict_subgoal` keeps using `_pooled_latent` above)
+
+
+def test_language_grounded_target_pooling_shape_gradient_and_nan_safety() -> None:
+    d = 12
+    pooling = LanguageGroundedTargetPooling(d)
+    image_tokens = torch.randn(3, 20, d, requires_grad=True)
+    text_tokens = torch.randn(3, 4, d, requires_grad=True)
+    state_token = torch.randn(3, 1, d, requires_grad=True)
+    tokens, pad_mask, modality_ids = _build_modality_batch(image_tokens, text_tokens, state_token)
+
+    grounded = pooling(tokens, pad_mask, modality_ids)
+    assert grounded.shape == (3, d)
+    assert torch.isfinite(grounded).all()
+
+    grounded.sum().backward()
+    assert image_tokens.grad is not None and torch.any(image_tokens.grad != 0)
+    assert text_tokens.grad is not None and torch.any(text_tokens.grad != 0)
+    assert any(p.grad is not None and torch.any(p.grad != 0) for p in pooling.parameters())
+
+
+def test_language_grounded_target_pooling_finite_when_every_image_token_is_padded() -> None:
+    """Every image token masked out (`latent_pad_mask=0` there) must not produce NaN -- the
+    zero-valid-image-tokens fallback must actually be exercised, not just present (mirrors
+    `test_pooled_latent_is_finite_when_a_modality_has_no_valid_tokens` above, for the new module)."""
+    d = 12
+    pooling = LanguageGroundedTargetPooling(d)
+    image_tokens = torch.randn(2, 10, d)
+    text_tokens = torch.randn(2, 4, d)
+    state_token = torch.randn(2, 1, d)
+    tokens, pad_mask, modality_ids = _build_modality_batch(image_tokens, text_tokens, state_token)
+    pad_mask = pad_mask.clone()
+    pad_mask[:, :10] = False  # mask out every image token
+
+    grounded = pooling(tokens, pad_mask, modality_ids)
+    assert torch.isfinite(grounded).all()
+
+
+def test_language_grounded_target_pooling_reacts_to_text_change_image_fixed() -> None:
+    """Swapping ONLY the text tokens (standing in for a different instruction), image/state held
+    fixed, must change the grounded output -- both because the query itself changes and because a
+    different query attends differently over the same image tokens."""
+    d = 12
+    pooling = LanguageGroundedTargetPooling(d)
+    image_tokens = torch.randn(1, 20, d)
+    text_a = torch.randn(1, 4, d)
+    state_token = torch.randn(1, 1, d)
+    text_b = torch.randn(1, 4, d)
+
+    tokens_a, pad_mask, modality_ids = _build_modality_batch(image_tokens, text_a, state_token)
+    tokens_b, _, _ = _build_modality_batch(image_tokens, text_b, state_token)
+    with torch.no_grad():
+        out_a = pooling(tokens_a, pad_mask, modality_ids)
+        out_b = pooling(tokens_b, pad_mask, modality_ids)
+    assert not torch.allclose(out_a, out_b)
+
+
+def test_language_grounded_target_pooling_reacts_to_image_change_text_fixed() -> None:
+    """Swapping ONLY the image tokens, text/state held fixed, must also change the grounded
+    output -- unlike a pure bag-of-words text encoder, the cross-attention's value/key side
+    depends on which image tokens are actually present, not just the query."""
+    d = 12
+    pooling = LanguageGroundedTargetPooling(d)
+    image_a = torch.randn(1, 20, d)
+    text_tokens = torch.randn(1, 4, d)
+    state_token = torch.randn(1, 1, d)
+    image_b = torch.randn(1, 20, d)
+
+    tokens_a, pad_mask, modality_ids = _build_modality_batch(image_a, text_tokens, state_token)
+    tokens_b, _, _ = _build_modality_batch(image_b, text_tokens, state_token)
+    with torch.no_grad():
+        out_a = pooling(tokens_a, pad_mask, modality_ids)
+        out_b = pooling(tokens_b, pad_mask, modality_ids)
+    assert not torch.allclose(out_a, out_b)
+
+
+def test_predict_target_xyz_uses_language_grounded_pooling_reacts_both_ways() -> None:
+    """End-to-end through `SafeDiffVLAPolicy._predict_target_xyz` (not the bare module): a
+    `temporal_decoder_grounded_grasp` policy's predicted target xyz must react to a text-only
+    change (image/state fixed) AND to an image-only change (text/state fixed)."""
+    policy = make_policy(architecture=ARCH)
+    policy.eval()
+    d = policy._multimodal_latent_dim()
+    image_tokens = torch.randn(1, 20, d)
+    text_a = torch.randn(1, 4, d)
+    text_b = torch.randn(1, 4, d)
+    state_token = torch.randn(1, 1, d)
+
+    tokens_text_a, pad_mask, modality_ids = _build_modality_batch(image_tokens, text_a, state_token)
+    tokens_text_b, _, _ = _build_modality_batch(image_tokens, text_b, state_token)
+    with torch.no_grad():
+        target_text_a = policy._predict_target_xyz(tokens_text_a, pad_mask, modality_ids)
+        target_text_b = policy._predict_target_xyz(tokens_text_b, pad_mask, modality_ids)
+    assert not torch.allclose(target_text_a, target_text_b)
+
+    image_a = torch.randn(1, 20, d)
+    image_b = torch.randn(1, 20, d)
+    tokens_image_a, pad_mask2, modality_ids2 = _build_modality_batch(image_a, text_a, state_token)
+    tokens_image_b, _, _ = _build_modality_batch(image_b, text_a, state_token)
+    with torch.no_grad():
+        target_image_a = policy._predict_target_xyz(tokens_image_a, pad_mask2, modality_ids2)
+        target_image_b = policy._predict_target_xyz(tokens_image_b, pad_mask2, modality_ids2)
+    assert not torch.allclose(target_image_a, target_image_b)
+
+
+def test_language_grounded_target_pooling_only_built_for_grounded_grasp_architecture() -> None:
+    """Regression guard: `temporal_decoder` and `temporal_decoder_subgoal` must never build
+    `language_grounded_target_pooling` (it's grounded-grasp-only, and must not affect the
+    canonical decoder path at all), while `temporal_decoder_grounded_grasp` must."""
+    assert not hasattr(make_policy(architecture="temporal_decoder"), "language_grounded_target_pooling")
+    assert not hasattr(make_policy(architecture="temporal_decoder_subgoal"), "language_grounded_target_pooling")
+    assert hasattr(make_policy(architecture=ARCH), "language_grounded_target_pooling")
 
 
 # ---- TemporalActionDecoder target_xyz conditioning -----------------------------------------
@@ -513,6 +633,11 @@ def test_select_action_applies_reactive_close_when_near_target() -> None:
     batch = make_grounded_batch(batch_size=1)
     batch[OBS_STATE][:, :3] = 0.0
     action = policy.select_action(batch)
+    # Force a clearly-"open" gripper value on the decoder's own (otherwise randomly-initialized,
+    # not reliably far from the force-closed value below by chance) output, so this assertion is
+    # deterministic regardless of global RNG state / test execution order.
+    action = action.clone()
+    action[0, GRIPPER_INDEX_RAW] = 5.0
     # Force the cached target to sit right on top of the (zeroed) current EE position, then ask
     # again on the same still-open queue item's *next* call is not needed -- directly drive the
     # helper the way `select_action` itself does, for a deterministic, isolated check.

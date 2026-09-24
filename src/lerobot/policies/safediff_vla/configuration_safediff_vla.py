@@ -12,6 +12,9 @@ ARCHITECTURES = {
     "temporal_decoder",
     "temporal_decoder_subgoal",
     "temporal_decoder_grounded_grasp",
+    "temporal_decoder_instruction",
+    "temporal_decoder_text_crossattn",
+    "temporal_decoder_grounded_grasp_v2",
 }
 
 
@@ -60,6 +63,73 @@ class SafeDiffVLAConfig(PreTrainedConfig):
     #       the predicted target (see `SafeDiffVLAPolicy._grounded_grasp_reactive_close`). No other
     #       architecture's behavior changes at all -- every new field/branch below is read only
     #       when `architecture == "temporal_decoder_grounded_grasp"`.
+    #   "temporal_decoder_instruction": experimental. `temporal_decoder` plus the instruction
+    #       itself added as one more global-conditioning term on every horizon query -- masked-mean
+    #       TEXT_MODALITY tokens (see `utils.masked_mean_by_modality`), projected and added
+    #       exactly like `subgoal_state`/`target_xyz` above (`temporal_decoder.py`'s
+    #       `use_instruction`). No `TargetPointHead`, no auxiliary loss, no decoder-conditioning
+    #       toggle, no reactive close -- the ONLY change from plain `temporal_decoder` is this one
+    #       additive term on the query. Exists to test whether the canonical decoder's own action
+    #       output can be made instruction-conditioned directly (bypassing the
+    #       `temporal_decoder_grounded_grasp` `TargetPointHead` path entirely, which held-out
+    #       xyz regression improved but never made the actual card selection track the
+    #       instruction -- identity-flip rate stayed 0-25% across two independent pooling designs).
+    #       Also did not move identity-flip/correct-card rates (see
+    #       `temporal_decoder_text_crossattn` below).
+    #   "temporal_decoder_text_crossattn": experimental. `temporal_decoder` plus an EXTRA
+    #       cross-attention over the raw, un-pooled per-token text sequence, applied after the
+    #       canonical multimodal cross-attention/self-attention stack (`temporal_decoder.py`'s
+    #       `use_text_crossattn`): `queries -> canonical cross-attn(full multimodal memory) ->
+    #       extra text-only cross-attn(text tokens, no mean/max/last-token pooling of any kind) ->
+    #       action head`. Every other instruction-conditioning attempt so far (`temporal_decoder_
+    #       instruction`'s additive pooled-instruction-embedding, and `temporal_decoder_grounded_
+    #       grasp`'s two `TargetPointHead` pooling designs) collapsed the instruction into a single
+    #       vector before it reached the query; this is the first to keep it as a full, un-pooled
+    #       token sequence throughout. No `TargetPointHead`, no auxiliary loss, no reactive close.
+    #       Also converged to the same identity-flip/correct-card rates as every other attempt.
+    #   "temporal_decoder_grounded_grasp_v2": experimental. Forward-path tracing on the plain
+    #       `temporal_decoder_grounded_grasp` checkpoint found the canonical model is NOT
+    #       instruction-blind (text representation, multimodal memory, and the predicted
+    #       trajectory all visibly change with the instruction; the nearest card to the predicted
+    #       close position changed with the instruction in 5/5 traced scenes) -- so "the model
+    #       ignores language entirely" was not the right diagnosis. What the same tracing found
+    #       instead: overall attention mass on TEXT_MODALITY tokens is ~12-13%, but attention
+    #       specifically on the tokens that name the target's identity (rank/suit) is only
+    #       ~0.7-2.4% -- the identity-carrying tokens are present and attended to, at all, far less
+    #       than boilerplate instruction tokens ("please", "pick", "the", "poker"). This
+    #       architecture targets that specific gap with an EXPLICIT target-language-query ->
+    #       visual-grounding-cross-attention pipeline (see `grounded_grasp_v2.py`):
+    #         image / language / state -> latent_tokens (unchanged)
+    #           -> `TargetQueryExtractor`: a small LEARNED query attention-pools over TEXT_MODALITY
+    #              tokens only (NOT mean pooling, NOT hard-coded rank/suit token-position parsing)
+    #              -> target_language_query [B, D], trained end-to-end against the target-xyz loss
+    #              below so it can learn which tokens actually matter.
+    #           -> `VisualGroundingCrossAttention`: that query attends over IMAGE_MODALITY tokens
+    #              only -> grounded_target_feature [B, D].
+    #           -> `TargetPointHead` (the "TargetXYZHead") -> predicted_target_xyz [B, 3].
+    #       Target supervision (`utils.find_grasp_target`, same polarity/padding fix as
+    #       `temporal_decoder_grounded_grasp`, unchanged): the first valid open->close transition's
+    #       action xyz, masked to samples where such a transition exists in the future horizon.
+    #       `TemporalActionDecoder` (`temporal_decoder.py`'s `use_grounded_grasp_v2`, canonical
+    #       `nn.TransformerDecoder` core UNCHANGED) gets three new additive global-conditioning
+    #       terms on top of `current_state` (already there for every architecture):
+    #       `grounded_target_feature`, `predicted_target_xyz` (reusing the same `target_xyz_encoder`
+    #       `temporal_decoder_grounded_grasp` already has), and a binary grasp-phase embedding
+    #       (0=PRE_GRASP, 1=POST_GRASP -- during training, read directly off `observation.state`'s
+    #       own gripper channel via `utils._state_gripper_is_open`; at inference, tracked as the
+    #       policy's own persistent per-episode state, flipped by the reactive-close mechanism
+    #       below). No target-conditioning ablation toggle this time (always on) -- there is no
+    #       `grounded_grasp_condition_decoder_on_target`-equivalent field for this architecture.
+    #
+    #       Inference-only reactive close (`SafeDiffVLAPolicy._grounded_grasp_v2_reactive_close`)
+    #       goes further than `temporal_decoder_grounded_grasp`'s: on proximity trigger it also
+    #       flips the policy's own phase state to POST_GRASP and clears the executor's action
+    #       queue, forcing a fresh replan (now conditioned on phase=POST_GRASP) on the very next
+    #       step, instead of continuing to execute a chunk planned before the grasp closed. A
+    #       one-shot latch keeps the gripper closed for the rest of the episode once triggered (no
+    #       reopening) -- this behavior is EXPERIMENTAL and specific to `select_poker`'s
+    #       grasp/lift-only validation; a place task would need a separate release phase this does
+    #       not implement.
     architecture: str = "temporal_decoder"
     n_obs_steps: int = 1
     # Must match the backbone's own native chunk size (`backbone.config.chunk_size` /
@@ -309,7 +379,15 @@ class SafeDiffVLAConfig(PreTrainedConfig):
         # the current pose, action the next commanded one), so this is a real constraint, not
         # an arbitrary one.
         if (
-            self.architecture in ("temporal_decoder", "temporal_decoder_subgoal", "temporal_decoder_grounded_grasp")
+            self.architecture
+            in (
+                "temporal_decoder",
+                "temporal_decoder_subgoal",
+                "temporal_decoder_grounded_grasp",
+                "temporal_decoder_instruction",
+                "temporal_decoder_text_crossattn",
+                "temporal_decoder_grounded_grasp_v2",
+            )
             and self.robot_state_feature.shape[0] != 7
         ):
             raise ValueError(
