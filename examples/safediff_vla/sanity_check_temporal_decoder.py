@@ -134,14 +134,14 @@ def main() -> None:
 
     # ---- 1. shape test ------------------------------------------------------------------
     logger.info("=== 1. shape test ===")
-    latent_tokens, latent_pad_mask = policy._encode_multimodal_latent(batch)
+    latent_tokens, latent_pad_mask, latent_modality_ids = policy._encode_multimodal_latent(batch)
     current_state = policy._current_state(batch)
     describe("VLM latent tokens", latent_tokens)
     describe("latent pad mask", latent_pad_mask)
     describe("current_state", current_state)
     describe("target actions", batch["action"])
     if use_subgoal:
-        pooled = policy.latent_pool_projection(policy._pooled_latent(latent_tokens, latent_pad_mask))
+        pooled = policy.latent_pool_projection(policy._pooled_latent(latent_tokens, latent_pad_mask, latent_modality_ids))
         predicted_subgoal = policy.subgoal_state_predictor(pooled, current_state)
         describe("predicted subgoal state", predicted_subgoal)
     pred_actions, metrics = policy.plan_action_chunk(batch)

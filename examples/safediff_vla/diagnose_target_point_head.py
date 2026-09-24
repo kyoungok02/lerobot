@@ -244,8 +244,8 @@ def run_tiny_overfit_test(policy_source: str, device: str, n_samples: int, n_ste
     gt_target_norm = (gt_target_raw - policy.action_pos_mean) / policy.action_pos_std
 
     with torch.no_grad():
-        latent_tokens, latent_pad_mask = policy._encode_multimodal_latent(batch)
-        pooled_latent = policy._pooled_latent(latent_tokens, latent_pad_mask).detach()
+        latent_tokens, latent_pad_mask, latent_modality_ids = policy._encode_multimodal_latent(batch)
+        pooled_latent = policy._pooled_latent(latent_tokens, latent_pad_mask, latent_modality_ids).detach()
 
     optimizer = torch.optim.Adam(policy.target_point_head.parameters(), lr=lr)
     history = []

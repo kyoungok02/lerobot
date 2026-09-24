@@ -273,9 +273,17 @@ def main() -> None:
         for ckpt in args.held_out_checkpoints
     ]
 
+    # Part B needs the VLABench/dm_control simulator (a manual, non-pip install -- see
+    # `pyproject.toml`'s vlabench note); not every environment running this script has it. Never
+    # let that swallow Part A's (already computed, often much slower to redo) results -- write
+    # what succeeded either way and report the failure in the summary instead of crashing.
     instruction_swap = None
     if not args.skip_instruction_swap_probe:
-        instruction_swap = run_instruction_swap_probe(args.device, output_dir)
+        try:
+            instruction_swap = run_instruction_swap_probe(args.device, output_dir)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Part B (instruction-swap probe) failed; Part A results are unaffected")
+            instruction_swap = {"error": f"{type(e).__name__}: {e}"}
 
     summary = {
         "part_a_held_out_target_point_head": held_out_results,
