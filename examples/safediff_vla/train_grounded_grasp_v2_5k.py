@@ -51,6 +51,12 @@ def main() -> None:
     parser.add_argument("--save-freq", type=int, default=5000)
     parser.add_argument("--output-dir", default="outputs/train/safediff_vla_grounded_grasp_v2_5k")
     parser.add_argument("--job-name", default="safediff_vla_grounded_grasp_v2_5k")
+    # Reproducibility-run overrides only (independent-reproduction pass) -- pure DataLoader/RNG
+    # infra knobs, not a model hyperparameter, architecture, or loss term, so varying these between
+    # runs doesn't violate "keep architecture/loss/hyperparameters identical to B's v2". Defaults
+    # match B's v2 script (seed=1000, num_workers=8) exactly when left unset.
+    parser.add_argument("--seed", type=int, default=1000)
+    parser.add_argument("--num-workers", type=int, default=8)
     args = parser.parse_args()
     if args.steps > 5000:
         raise ValueError("This pilot is 5k steps only -- do not extend to 20k without a separate decision.")
@@ -92,8 +98,8 @@ def main() -> None:
         output_dir=Path(args.output_dir),
         job_name=args.job_name,
         resume=False,
-        seed=1000,
-        num_workers=8,
+        seed=args.seed,
+        num_workers=args.num_workers,
         batch_size=4,
         steps=args.steps,
         log_freq=100,

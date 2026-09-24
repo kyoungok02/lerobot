@@ -29,7 +29,9 @@ torchrun --nproc-per-node=8 $(which lerobot-train) \
 """
 
 import dataclasses
+import functools
 import logging
+import random
 import sys
 import time
 from collections.abc import Iterator
@@ -40,6 +42,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from accelerate import Accelerator
 
+import numpy as np
 import torch
 from termcolor import colored
 from torch.optim import Optimizer
@@ -256,6 +259,15 @@ def update_policy(
     return train_metrics, output_dict
 
 
+def _seed_dataloader_worker(worker_id: int, base_seed: int) -> None:
+    """`DataLoader(worker_init_fn=...)`: seeds each worker process's own Python/NumPy RNGs off
+    `base_seed + worker_id`, deterministically and distinctly per worker. Module-level (not a
+    closure) so multiprocessing can pickle it for spawned worker processes."""
+    worker_seed = base_seed + worker_id
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
 def make_dataloaders(
     cfg: TrainPipelineConfig,
     dataset,
@@ -338,6 +350,22 @@ def make_dataloaders(
     # declares language columns; otherwise stay on PyTorch's default
     # collate so non-language training runs are unaffected.
     collate_fn = lerobot_collate_fn if dataset.meta.has_language_columns else None
+    # Defense-in-depth reproducibility: sample ORDER for the non-streaming path above is already
+    # fully deterministic (EpisodeAwareSampler(seed=cfg.seed), independent of num_workers -- see
+    # that branch's own comment), and this repo's default `image_transforms.enable=False` means no
+    # worker currently draws from a random augmentation. `worker_init_fn` seeds each worker's own
+    # Python/NumPy RNGs anyway (deterministically derived from cfg.seed + worker id), so behavior
+    # stays reproducible even if a future dataset config enables per-worker randomness (e.g. image
+    # augmentation) without anyone having to remember to add this then. A `functools.partial` of a
+    # MODULE-level function (not a closure) -- multiprocessing needs to pickle this to hand it to
+    # spawned worker processes, and a closure captured over `cfg` isn't picklable.
+    worker_init_fn = (
+        functools.partial(_seed_dataloader_worker, base_seed=cfg.seed if cfg.seed is not None else 0)
+        if cfg.num_workers > 0
+        else None
+    )
+    generator = torch.Generator()
+    generator.manual_seed(cfg.seed if cfg.seed is not None else 0)
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=cfg.num_workers,
@@ -350,6 +378,8 @@ def make_dataloaders(
         prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
         persistent_workers=cfg.persistent_workers and cfg.num_workers > 0,
         multiprocessing_context=cfg.dataloader_multiprocessing_context if cfg.num_workers > 0 else None,
+        worker_init_fn=worker_init_fn,
+        generator=generator,
     )
 
     # Build eval dataloader if a held-out split exists
