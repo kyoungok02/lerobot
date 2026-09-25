@@ -15,6 +15,7 @@ ARCHITECTURES = {
     "temporal_decoder_instruction",
     "temporal_decoder_text_crossattn",
     "temporal_decoder_grounded_grasp_v2",
+    "temporal_decoder_grounded_grasp_v2_5",
 }
 
 
@@ -130,6 +131,55 @@ class SafeDiffVLAConfig(PreTrainedConfig):
     #       reopening) -- this behavior is EXPERIMENTAL and specific to `select_poker`'s
     #       grasp/lift-only validation; a place task would need a separate release phase this does
     #       not implement.
+    #   "temporal_decoder_grounded_grasp_v2_5": experimental. v2's `TemporalActionDecoder` regresses
+    #       one 50-step chunk end to end, including the final centimeters of the approach where
+    #       diagnostic oracle experiments found close-TIMING (not just target-xyz accuracy) is a
+    #       real bottleneck -- and v2's own held-out eval never moved task success even once
+    #       target-xyz localization improved. This architecture changes NOTHING about v2's
+    #       grounding/localization/global-decoder pipeline -- `TargetQueryExtractor`,
+    #       `VisualGroundingCrossAttention`, `TargetPointHead`, `TemporalActionDecoder` are all
+    #       reused exactly as v2 already computes them, in their own separate branch of
+    #       `modeling_safediff_vla.py` (v2's own branch/tests are completely untouched). Instead it
+    #       adds ONE new module, `LocalGraspRefiner` (see `local_grasp_refiner.py`), and a 3-stage
+    #       runtime controller:
+    #         PRE_GRASP: v2's own 50-step global approach, completely unchanged, until
+    #           `||current_ee_xyz - predicted_target_xyz|| <= local_grasp_radius_m` (one-shot --
+    #           this transition can only ever happen once per episode).
+    #         LOCAL_GRASP: `LocalGraspRefiner` takes over -- genuinely closed-loop, re-observing and
+    #           replanning EVERY single step (`local_grasp_execute_horizon=1`), unlike every other
+    #           stage/architecture in this file, which all plan an open-loop chunk and execute it
+    #           for `execute_horizon` steps before replanning. The refiner predicts a bounded
+    #           RESIDUAL `(delta_xyz, delta_rotation, gripper)` relative to the CURRENT observed EE
+    #           pose -- never an absolute target pose -- conditioned explicitly on
+    #           `relative_xyz = predicted_target_xyz - current_ee_xyz` (v2's own predicted target,
+    #           just consumed differently) alongside `grounded_target_feature`, a fresh
+    #           masked-mean image-token pooling, and `current_state`. `delta_xyz`/`delta_rotation`
+    #           are `tanh`-bounded by `local_grasp_max_delta_xyz_m`/`local_grasp_max_delta_rot_rad`
+    #           so each step can only ever nudge the arm by a few cm/degrees. `gripper` is predicted
+    #           directly by the refiner (NOT v1/v2's proximity-based forced close, which rarely
+    #           fired in v2's own held-out reproduction) -- once it first reads "closed", a one-shot
+    #           latch holds it closed (preventing open/close chatter) and the SAME event ends
+    #           LOCAL_GRASP.
+    #         POST_GRASP: back to v2's own global decoder, now conditioned on phase=POST_GRASP,
+    #           exactly like v2's own POST_GRASP stage -- reusing `use_grounded_grasp_v2`'s existing
+    #           decoder-conditioning wiring UNCHANGED, since LOCAL_GRASP never calls the decoder at
+    #           all and PRE_GRASP/POST_GRASP are the only two values ever fed to its existing binary
+    #           `grasp_phase` embedding.
+    #       Training (see `local_grasp_refiner.py`'s own docstring): `LocalGraspRefiner` is
+    #       supervised only on samples within `local_grasp_window_k` steps of a demonstrated
+    #       open->close transition (`utils.find_grasp_target`'s own transition-finding formula,
+    #       duplicated -- not imported -- specifically so v1/v2's `find_grasp_target` itself is
+    #       never touched), predicting a short `local_grasp_action_horizon`-step residual chunk
+    #       against `action[t+i] - current_ee_xyz[t]` for each such sample -- never the full
+    #       50-step target. `loss_total = loss_v2_global + lambda_local_grasp * loss_local`; v2's
+    #       own loss terms (including `loss_target`) are computed identically to v2's own branch.
+    #       The recommended first experiment (`local_grasp_freeze_global_modules`, default True)
+    #       freezes every v2 module (backbone, `TargetQueryExtractor`,
+    #       `VisualGroundingCrossAttention`, `TargetPointHead`, `TemporalActionDecoder`) so ONLY
+    #       `LocalGraspRefiner` trains -- isolating "does the local closed-loop residual controller
+    #       improve grasp precision" from any change to v2's own already-checkpointed behavior. A
+    #       v2 checkpoint's weights may be loaded to initialize this architecture's shared modules;
+    #       a fresh full-model run is a separate, later decision.
     architecture: str = "temporal_decoder"
     n_obs_steps: int = 1
     # Must match the backbone's own native chunk size (`backbone.config.chunk_size` /
@@ -248,6 +298,52 @@ class SafeDiffVLAConfig(PreTrainedConfig):
     # coupled together under a single architecture. Has no effect on any other architecture.
     grounded_grasp_condition_decoder_on_target: bool = True
 
+    # -- `temporal_decoder_grounded_grasp_v2_5` only (see `local_grasp_refiner.py`) --
+    # Inference-only: physical distance (meters, robot-base frame) between the current EE position
+    # and v2's own predicted grasp target below which `SafeDiffVLAPolicy.select_action` switches
+    # from PRE_GRASP (v2's global 50-step decoder) to LOCAL_GRASP (`LocalGraspRefiner`, per-step
+    # closed-loop). One-shot per episode -- see `_v25_stage`'s docstring in `local_grasp_refiner.py`.
+    # Untuned first-cut default (same value used as v1/v2's own `grounded_grasp_close_threshold_m`
+    # neighborhood-of-contact assumption); NOT swept in this pilot.
+    local_grasp_radius_m: float = 0.10
+    # Hard bound (physical meters) on `LocalGraspRefiner`'s per-step position residual:
+    # `delta_xyz = local_grasp_max_delta_xyz_m * tanh(raw_delta_xyz)`. Conservative first-cut
+    # default (a few cm) so each closed-loop step can only ever locally nudge the arm, never jump;
+    # NOT swept in this pilot.
+    local_grasp_max_delta_xyz_m: float = 0.03
+    # Hard bound (radians) on `LocalGraspRefiner`'s per-step rotation residual, same `tanh`-bound
+    # pattern as `local_grasp_max_delta_xyz_m`. Conservative first-cut default (~3 degrees); NOT
+    # swept in this pilot.
+    local_grasp_max_delta_rot_rad: float = 0.05
+    # Width of the residual CHUNK `LocalGraspRefiner` predicts per call -- a receding-horizon
+    # training target only (see `local_grasp_refiner.py`'s docstring); at inference only the first
+    # `local_grasp_execute_horizon` step(s) are ever executed before a fresh re-observe/replan.
+    local_grasp_action_horizon: int = 5
+    # How many of `LocalGraspRefiner`'s predicted horizon steps are actually executed before
+    # re-observing and replanning from scratch. Fixed at 1 for this pilot (genuine per-step
+    # closed-loop control) -- see the architecture docstring above for why this is the one stage in
+    # the whole policy that isn't open-loop-chunk-then-queue.
+    local_grasp_execute_horizon: int = 1
+    # `LocalGraspRefiner` is only ever supervised on training samples within this many steps of a
+    # demonstrated open->close transition (`utils.find_grasp_target`'s own transition-finding
+    # formula, duplicated -- not imported -- in `modeling_safediff_vla.py` so `find_grasp_target`
+    # itself is never touched) -- never the full 50-step window a sample's own batch happens to
+    # carry. NOT swept in this pilot.
+    local_grasp_window_k: int = 10
+    # Weight of `LocalGraspRefiner`'s own combined local loss
+    # (`loss_local_pos`/`loss_local_rot`/`loss_local_grip`, dim-count-weighted like the global
+    # action loss) added on top of v2's own (unmodified) global loss:
+    # `loss_total = loss_v2_global + lambda_local_grasp * loss_local`. Initial value, no sweep.
+    lambda_local_grasp: float = 1.0
+    # Hidden width of `LocalGraspRefiner`'s small MLP (mirrors `target_head_hidden_dim`).
+    local_grasp_hidden_dim: int = 256
+    # First-experiment ablation (default True, see architecture docstring): freeze every v2 module
+    # (backbone, `TargetQueryExtractor`, `VisualGroundingCrossAttention`, `TargetPointHead`,
+    # `TemporalActionDecoder`) so ONLY `LocalGraspRefiner` is trainable -- isolating the local
+    # controller's own effect from any drift in v2's already-checkpointed global behavior. Setting
+    # this False (a full-model finetune) is a separate, later experiment, not run by this pilot.
+    local_grasp_freeze_global_modules: bool = True
+
     # Per-sample squared-L2 gap (in normalized state units) between what the subgoal predictor
     # expected `execute_horizon` steps after the previous chunk and the state actually observed
     # now, above which the previous chunk is considered "not complete": instead of committing to
@@ -329,6 +425,20 @@ class SafeDiffVLAConfig(PreTrainedConfig):
             raise ValueError("grounded_grasp_gripper_open_threshold must be in (0, 1)")
         if self.grounded_grasp_close_threshold_m <= 0:
             raise ValueError("grounded_grasp_close_threshold_m must be positive")
+        if self.local_grasp_radius_m <= 0:
+            raise ValueError("local_grasp_radius_m must be positive")
+        if self.local_grasp_max_delta_xyz_m <= 0:
+            raise ValueError("local_grasp_max_delta_xyz_m must be positive")
+        if self.local_grasp_max_delta_rot_rad <= 0:
+            raise ValueError("local_grasp_max_delta_rot_rad must be positive")
+        if self.local_grasp_action_horizon <= 0:
+            raise ValueError("local_grasp_action_horizon must be positive")
+        if not 0 < self.local_grasp_execute_horizon <= self.local_grasp_action_horizon:
+            raise ValueError("local_grasp_execute_horizon must be in [1, local_grasp_action_horizon]")
+        if self.local_grasp_window_k <= 0:
+            raise ValueError("local_grasp_window_k must be positive")
+        if self.lambda_local_grasp < 0:
+            raise ValueError("lambda_local_grasp must be non-negative")
         backbone_chunk_size = self._backbone_native_chunk_size()
         if backbone_chunk_size is not None and backbone_chunk_size != self.action_horizon:
             logger.warning(
@@ -387,6 +497,7 @@ class SafeDiffVLAConfig(PreTrainedConfig):
                 "temporal_decoder_instruction",
                 "temporal_decoder_text_crossattn",
                 "temporal_decoder_grounded_grasp_v2",
+                "temporal_decoder_grounded_grasp_v2_5",
             )
             and self.robot_state_feature.shape[0] != 7
         ):
